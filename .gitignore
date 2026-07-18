@@ -1,0 +1,13 @@
+# build output
+src/build/
+
+# generated at build time by gen_def.py
+src/thunks.asm
+src/exports.def
+src/dxgi_names.h
+
+# vendor/DLSS and vendor/minhook are git submodules (see .gitmodules), not ignored
+
+*.png
+*.raw
+*.log

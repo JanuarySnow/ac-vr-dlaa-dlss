@@ -1,0 +1,6 @@
+[submodule "vendor/DLSS"]
+	path = vendor/DLSS
+	url = https://github.com/NVIDIA/DLSS.git
+[submodule "vendor/minhook"]
+	path = vendor/minhook
+	url = https://github.com/TsudaKageyu/minhook.git
