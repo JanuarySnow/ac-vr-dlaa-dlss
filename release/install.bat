@@ -60,7 +60,7 @@ if not exist "!AC_DIR!\acs.exe" (
 )
 
 rem --- 5. refuse while the game is running: the DLL would be locked ---
-tasklist /FI "IMAGENAME eq acs.exe" 2>nul | "%SystemRoot%\System32\find.exe" /i "acs.exe" >nul
+tasklist /FI "IMAGENAME eq acs.exe" 2>nul | find /i "acs.exe" >nul
 if not errorlevel 1 (
     echo.
     echo Assetto Corsa is running - close it first, then run this installer again.
@@ -75,6 +75,16 @@ if not exist "!AC_DIR!acre.ini" (
     echo installed acre.ini ^(default: mode=dlaa^)
 ) else (
     echo acre.ini already present - left as-is
+)
+rem AC/CSP usually already ships this; only fill the gap, never overwrite a
+rem working copy that's already there.
+if exist "%HERE%nvngx_dlss.dll" (
+    if not exist "!AC_DIR!nvngx_dlss.dll" (
+        copy /y "%HERE%nvngx_dlss.dll" "!AC_DIR!nvngx_dlss.dll" >nul
+        echo installed nvngx_dlss.dll ^(NVIDIA DLSS runtime^)
+    ) else (
+        echo nvngx_dlss.dll already present - left as-is
+    )
 )
 rem dxgi_real.dll lets the proxy forward to the real DXGI - generated from THIS
 rem machine's own System32 copy, never shipped in the release.
