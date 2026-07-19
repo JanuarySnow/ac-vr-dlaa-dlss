@@ -27,5 +27,9 @@ DLSS is not a great benefit due to a higher CPU cost than normal, but it does re
 DLAA is nice though, very similar results to MSAA 8x but at a much lower performance cost
 
 I will not paywall this on Patreon, this is GPL licensed, its free, use it. have it, fork it, improve it. 
+But please do buy me a coffee if you want to :
+
+[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/januarysnow)
+
 
 If X4fab implements VR DLAA into CSP then ill probably retire this as his will probably be better. but in the meantime, this works. 
