@@ -18,6 +18,7 @@
 extern "C" void  acre_log(const char *fmt, ...);
 extern "C" int   acre_cfg_mode(void);
 extern "C" float acre_cfg_upscale(void);
+extern "C" float acre_cfg_render_scale(void);
 
 namespace {
 
@@ -57,6 +58,19 @@ void STDMETHODCALLTYPE hkGetRRTS(void *self, uint32_t *pw, uint32_t *ph) {
         g_reduced_w = rw; g_reduced_h = rh; g_res_active = true;
         acre_log("  res: native %ux%u -> render %ux%u (dlss upscale %.2f)",
                  g_native_w, g_native_h, rw, rh, f);
+    } else if (acre_cfg_mode() == 1 && g_native_w && g_native_h &&
+               acre_cfg_render_scale() > 1.005f) {
+        // dlaa supersampling: render ABOVE native and let DLAA run at that size. The
+        // compositor downsamples to the panel, so g_res_active stays false — there is no
+        // submit-time upscale to do.
+        float f = acre_cfg_render_scale();
+        unsigned rw = (unsigned)(g_native_w * f + 0.5f) & ~1u;
+        unsigned rh = (unsigned)(g_native_h * f + 0.5f) & ~1u;
+        *pw = rw; *ph = rh;
+        g_res_active = false;
+        acre_log("  res: native %ux%u -> render %ux%u (dlaa render_scale %.2f, %.2fx pixels)",
+                 g_native_w, g_native_h, rw, rh, f, (double)(rw * (double)rh) /
+                 ((double)g_native_w * g_native_h));
     } else {
         g_res_active = false;
         acre_log("  res: native %ux%u (no reduction, mode=%d)", g_native_w, g_native_h, acre_cfg_mode());

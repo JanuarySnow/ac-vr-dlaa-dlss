@@ -12,8 +12,13 @@ extern "C" void acre_log(const char *fmt, ...);
 extern "C" bool acre_ngx_init(ID3D11Device *dev);
 extern "C" bool acre_ngx_ensure_dlaa(ID3D11DeviceContext *ctx, unsigned w, unsigned h);
 extern "C" void acre_cfg_poll(void);
+extern "C" float acre_cfg_render_scale(void);
+extern "C" void acre_cap_poll(void);
+extern "C" void acre_cap_tick(void);
 extern "C" void acre_dlss_frame(ID3D11Device *dev, ID3D11DeviceContext *ctx, uintptr_t cam);
 extern "C" void acre_install_om_hook(ID3D11DeviceContext *ctx);
+extern "C" void acre_diag_preflight(void);
+extern "C" void acre_diag_tick(void);
 extern "C" bool acre_try_install_submit_hook(void);
 extern "C" bool acre_install_res_hook(void);
 extern "C" int acre_cfg_mode(void);
@@ -179,9 +184,12 @@ HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain *sc, UINT sync, UINT flags) {
         }
         t0 = now;
     }
-    if ((n % 30) == 0) acre_cfg_poll();     // ini hot-reload
-    if (n >= 120)                           // a coupla seconds in, scene loaded
+    if ((n % 30) == 0) { acre_cfg_poll(); acre_cap_poll(); }   // ini hot-reload + capture trigger
+    acre_cap_tick();                        // capture pair writes/cooldown
+    if (n >= 120) {                         // a coupla seconds in, scene loaded
         frame_guarded(sc);
+        acre_diag_tick();
+    }
     return g_orig_present(sc, sync, flags);
 }
 
@@ -256,10 +264,12 @@ DWORD WINAPI init_thread(LPVOID) {
     // Install the render-res reduction hook first up, it must be in place
     // before AC builds StereoCameraVive . It only inline-hooks an
     // acs.exe function via MinHook
-    if (acre_cfg_mode() == 2) acre_install_res_hook();
+    if (acre_cfg_mode() == 2 ||
+        (acre_cfg_mode() == 1 && acre_cfg_render_scale() > 1.005f)) acre_install_res_hook();
     // Let AC finish creating its own device/swapchain first avoids racing its init.
     Sleep(4000);
     acre_log("  hook: init thread starting");
+    acre_diag_preflight();
     install_present_hook();
     return 0;
 }

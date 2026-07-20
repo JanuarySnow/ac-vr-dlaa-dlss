@@ -30,6 +30,12 @@ extern "C" float acre_cfg_mask_scale(void);
 extern "C" int acre_cfg_jflip_x(void);
 extern "C" int acre_cfg_jflip_y(void);
 extern "C" int acre_cfg_mv_flip(void);
+extern "C" void acre_diag_eyedist(float d);
+extern "C" const float *acre_eye_view(int eye);   // om_hook: bind-time snapshot
+extern "C" int acre_cap_active(void);
+extern "C" void acre_cap_in(ID3D11Device *, ID3D11DeviceContext *, int, ID3D11Texture2D *);
+extern "C" void acre_cap_out(ID3D11Device *, ID3D11DeviceContext *, int, ID3D11Texture2D *,
+                             ID3D11Texture2D *);
 
 // MV sign as handed to DLSS
 static float mv_scale(void) { return acre_cfg_mv_flip() ? -1.0f : 1.0f; }
@@ -324,10 +330,24 @@ extern "C" void acre_dlss_inplace(ID3D11Device *dev, ID3D11DeviceContext *ctx,
     if (!g_ip_cs && !ip_init(dev, color)) return;
     if (!ip_depth_srv(dev, depth)) { acre_log("  ip: depth SRV failed"); return; }
 
+    if (acre_cap_active()) acre_cap_in(dev, ctx, eye, color);
+
     float view[16], proj[16], vp[16];
-    memcpy(view, reinterpret_cast<void *>(cam + 2512), 64);                 // viewMatrix
+    const float *ev = acre_eye_view(eye);          // this eye's view, snapshotted at its
+    if (ev) memcpy(view, ev, 64);                  // scene bind — cam+2512 has moved on
+    else    memcpy(view, reinterpret_cast<void *>(cam + 2512), 64);
     memcpy(proj, reinterpret_cast<void *>(cam + 1968 + eye * 176 + 72), 64); // viveData[eye].eyeProjection
     mat_mul(view, proj, vp);
+
+    // eye/view pairing check: within a frame the two eyes' view translations must sit
+    // ~IPD apart. Near-zero means both dispatches read the same eye's view (race).
+    static float eyet[2][3];
+    eyet[eye][0] = view[12]; eyet[eye][1] = view[13]; eyet[eye][2] = view[14];
+    if (eye == 1) {
+        float dx = eyet[1][0] - eyet[0][0], dy = eyet[1][1] - eyet[0][1],
+              dz = eyet[1][2] - eyet[0][2];
+        acre_diag_eyedist(sqrtf(dx * dx + dy * dy + dz * dz));
+    }
 
     static int matlog = -1;
     if (matlog < 0) matlog = GetEnvironmentVariableA("ACRE_MATLOG", nullptr, 0) ? 1 : 0;
@@ -422,6 +442,7 @@ extern "C" void acre_dlss_inplace(ID3D11Device *dev, ID3D11DeviceContext *ctx,
     NVSDK_NGX_Result r = NGX_D3D11_EVALUATE_DLSS_EXT(
         ctx, (NVSDK_NGX_Handle *)acre_ngx_handle_eye(eye),
         (NVSDK_NGX_Parameter *)acre_ngx_eval_params_eye(eye), &ep);
+    if (acre_cap_active()) acre_cap_out(dev, ctx, eye, NVSDK_NGX_FAILED(r) ? nullptr : g_ip_out, g_ip_mv);
     if (!NVSDK_NGX_FAILED(r)) {
         float sharp = acre_cfg_sharpness();
         static ID3D11ShaderResourceView *out_srv = nullptr;

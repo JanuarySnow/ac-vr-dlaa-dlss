@@ -42,7 +42,7 @@ set MH=%HERE%..\vendor\minhook
 rem MinHook (C, no CRT security warnings) built alongside our sources.
 cl /nologo /LD /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS /I"%HERE%." /I"%NGX%\include" /I"%MH%\include" ^
    /Fo%OUT%\ /Fe"%OUT%\dxgi.dll" ^
-   "%HERE%dxgi_proxy.c" "%HERE%dxgi_hook.cpp" "%HERE%ngx_dlss.cpp" "%HERE%dlss_pass.cpp" "%HERE%om_hook.cpp" "%HERE%submit_hook.cpp" "%HERE%res_hook.cpp" "%HERE%config.cpp" ^
+   "%HERE%dxgi_proxy.c" "%HERE%dxgi_hook.cpp" "%HERE%ngx_dlss.cpp" "%HERE%dlss_pass.cpp" "%HERE%om_hook.cpp" "%HERE%submit_hook.cpp" "%HERE%res_hook.cpp" "%HERE%config.cpp" "%HERE%diag.cpp" "%HERE%cap.cpp" ^
    "%MH%\src\buffer.c" "%MH%\src\hook.c" "%MH%\src\trampoline.c" "%MH%\src\hde\hde64.c" ^
    "%OUT%\thunks.obj" ^
    /link /DEF:"%HERE%exports.def" "%OUT%\dxgi_real.lib" ^

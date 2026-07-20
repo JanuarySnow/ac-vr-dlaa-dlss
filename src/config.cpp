@@ -17,6 +17,7 @@ struct Cfg {
     int  mode = 1;              // 0 off, 1 dlaa, 2 dlss (upscale)
     int  preset = 11;          // DLSS render preset (K=11)
     float upscale = 1.5f;      // dlss output/input ratio
+    float render_scale = 1.0f; // dlaa supersample: render target = native * this
     int  out_w = 0, out_h = 0; // absolute per-eye output target
     int  perfquality = 1;      // NVSDK_NGX_PerfQuality_Value (MaxQuality=1) for dlss
     int  jitter = 1;
@@ -41,6 +42,15 @@ void set_upscale(const char *v) {
     if (!_stricmp(v, "performance"))    { g.upscale = 2.0f;  g.perfquality = 0; }   // MaxPerf
     else if (!_stricmp(v, "balanced"))  { g.upscale = 1.72f; g.perfquality = 2; }   // Balanced
     else                                { g.upscale = 1.5f;  g.perfquality = 1; }   // Quality
+}
+
+// Supersampling is quadratic in cost, so refuse silly values: 2.0 is already 4x the pixels.
+// Below 1.0 would mean rendering under native, which is what mode=dlss is for.
+float clamp_render_scale(float f) {
+    if (!(f > 0.0f)) return 1.0f;
+    if (f < 1.0f) return 1.0f;
+    if (f > 2.0f) return 2.0f;
+    return f;
 }
 
 char *trim(char *s) {
@@ -82,6 +92,7 @@ void load() {
             g.mode = !_stricmp(val, "off") ? 0 : !_stricmp(val, "dlss") ? 2 : 1;
         else if (!_stricmp(key, "preset"))        g.preset = preset_from_letter(val[0]);
         else if (!_stricmp(key, "upscale"))       set_upscale(val);
+        else if (!_stricmp(key, "render_scale"))  g.render_scale = clamp_render_scale((float)atof(val));
         else if (!_stricmp(key, "output_width"))  g.out_w = atoi(val);
         else if (!_stricmp(key, "output_height")) g.out_h = atoi(val);
         else if (!_stricmp(key, "jitter"))        g.jitter = atoi(val);
@@ -94,9 +105,10 @@ void load() {
         else if (!_stricmp(key, "sharpness"))     g.sharpness = (float)atof(val);
     }
     fclose(f);
-    acre_log("  cfg: mode=%d preset=%d upscale=%.2f out=%dx%d pq=%d jitter=%d reactive=%d autoexp=%d sharp=%.2f",
-             g.mode, g.preset, g.upscale, g.out_w, g.out_h, g.perfquality, g.jitter, g.reactive,
-             g.auto_exposure, g.sharpness);
+    acre_log("  cfg: mode=%d preset=%d upscale=%.2f render_scale=%.2f out=%dx%d pq=%d jitter=%d "
+             "reactive=%d autoexp=%d sharp=%.2f",
+             g.mode, g.preset, g.upscale, g.render_scale, g.out_w, g.out_h, g.perfquality,
+             g.jitter, g.reactive, g.auto_exposure, g.sharpness);
 }
 
 Cfg &cfg() { if (!g.loaded) load(); return g; }
@@ -116,15 +128,16 @@ extern "C" void acre_cfg_poll(void) {
     if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) return;
     if (CompareFileTime(&fad.ftLastWriteTime, &g.mtime) == 0) return;
     int old_dlss = (g.mode == 2);
-    float old_up = g.upscale;
+    float old_up = g.upscale, old_rs = g.render_scale;
     load();                                     // re-parse + log the new cfg line
-    if ((g.mode == 2) != old_dlss || g.upscale != old_up)
-        acre_log("  cfg: NOTE mode dlaa<->dlss and upscale ratio need a SESSION RESTART "
-                 "(render targets are sized at track load)");
+    if ((g.mode == 2) != old_dlss || g.upscale != old_up || g.render_scale != old_rs)
+        acre_log("  cfg: NOTE mode dlaa<->dlss, upscale ratio and render_scale need a SESSION "
+                 "RESTART (render targets are sized at track load)");
 }
 extern "C" int   acre_cfg_mode(void)        { return cfg().mode; }
 extern "C" int   acre_cfg_preset(void)      { return cfg().preset; }
 extern "C" float acre_cfg_upscale(void)     { return cfg().upscale; }
+extern "C" float acre_cfg_render_scale(void) { return cfg().render_scale; }
 extern "C" int   acre_cfg_out_w(void)       { return cfg().out_w; }
 extern "C" int   acre_cfg_out_h(void)       { return cfg().out_h; }
 extern "C" int   acre_cfg_perfquality(void) { return cfg().perfquality; }

@@ -8,6 +8,10 @@ src/dxgi_names.h
 
 # vendor/DLSS and vendor/minhook are git submodules (see .gitmodules), not ignored
 
+# release packaging output
+release/dist/
+release/*.zip
+
 *.png
 *.raw
 *.log

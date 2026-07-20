@@ -26,6 +26,10 @@ DLSS is not a great benefit due to a higher CPU cost than normal, but it does re
 
 DLAA is nice though, very similar results to MSAA 8x but at a much lower performance cost
 
+In DLAA mode you can also raise `render_scale` in acre.ini for supersampling above native res, for even cleaner edges at a (quadratic) performance cost. Needs a session restart to take effect.
+
+acre_proxy.log now runs a preflight check on startup and logs clearly if any of the settings above (SPS, MSAA, post-process AA, post-processing) are wrong, plus whether DLAA is actually active on both eyes — check it there first if something looks off.
+
 I will not paywall this on Patreon, this is GPL licensed, its free, use it. have it, fork it, improve it. 
 
 If X4fab implements VR DLAA into CSP then ill probably retire this as his will probably be better. but in the meantime, this works. 
