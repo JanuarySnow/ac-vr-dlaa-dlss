@@ -10,6 +10,7 @@ extern "C" void acre_log(const char *fmt, ...);
 extern "C" int acre_cfg_preset(void);
 extern "C" int acre_cfg_perfquality(void);
 extern "C" int acre_cfg_auto_exposure(void);
+extern "C" int acre_cfg_mv_lowres(void);
 
 namespace {
 bool g_ngx_inited = false;
@@ -83,9 +84,10 @@ static NVSDK_NGX_Parameter *g_dlss_params2[2] = {nullptr, nullptr};
 // changes in the ini
 extern "C" bool acre_ngx_create_dlaa(ID3D11DeviceContext *ctx, unsigned w, unsigned h);
 extern "C" bool acre_ngx_ensure_dlaa(ID3D11DeviceContext *ctx, unsigned w, unsigned h) {
-    static int cur_preset = -1, cur_ae = -1;
-    int p = acre_cfg_preset(), ae = acre_cfg_auto_exposure();
-    if (g_dlss2[0] && (cur_preset != -1) && (p != cur_preset || ae != cur_ae)) {
+    static int cur_preset = -1, cur_ae = -1, cur_mvlr = -1;
+    int p = acre_cfg_preset(), ae = acre_cfg_auto_exposure(), mvlr = acre_cfg_mv_lowres();
+    if (g_dlss2[0] && (cur_preset != -1) &&
+        (p != cur_preset || ae != cur_ae || mvlr != cur_mvlr)) {
         for (int eye = 0; eye < 2; eye++) {
             if (g_dlss2[eye]) { NVSDK_NGX_D3D11_ReleaseFeature(g_dlss2[eye]); g_dlss2[eye] = nullptr; }
             if (g_dlss_params2[eye]) { NVSDK_NGX_D3D11_DestroyParameters(g_dlss_params2[eye]); g_dlss_params2[eye] = nullptr; }
@@ -93,7 +95,7 @@ extern "C" bool acre_ngx_ensure_dlaa(ID3D11DeviceContext *ctx, unsigned w, unsig
         acre_log("  ngx: DLAA features released (preset/auto_exposure changed -> recreate)");
     }
     bool ok = acre_ngx_create_dlaa(ctx, w, h);
-    if (ok) { cur_preset = p; cur_ae = ae; }
+    if (ok) { cur_preset = p; cur_ae = ae; cur_mvlr = mvlr; }
     return ok;
 }
 
@@ -115,8 +117,12 @@ extern "C" bool acre_ngx_create_dlaa(ID3D11DeviceContext *ctx, unsigned w, unsig
         cp.Feature.InTargetWidth = w; cp.Feature.InTargetHeight = h;   // DLAA
         cp.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
         // no AutoExposure by default, its estimate flickers on dark high-contrast edges
-        cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
-                                  NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
+        // MVLowRes says the MVs are at render rather than display resolution. That is
+        // meaningful when upscaling; at DLAA's 1:1 it is at best a no-op and may cost
+        // sharpness, so it is switchable for A/B rather than assumed.
+        cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
+        if (acre_cfg_mv_lowres())
+            cp.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
         if (acre_cfg_auto_exposure())
             cp.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
         r = NGX_D3D11_CREATE_DLSS_EXT(ctx, &g_dlss2[eye], g_dlss_params2[eye], &cp);
@@ -145,7 +151,13 @@ extern "C" bool acre_ngx_create_upscale(ID3D11DeviceContext *ctx, unsigned inW, 
         NVSDK_NGX_DLSS_Create_Params cp = {};
         cp.Feature.InWidth = inW; cp.Feature.InHeight = inH;
         cp.Feature.InTargetWidth = outW; cp.Feature.InTargetHeight = outH;
-        cp.Feature.InPerfQualityValue = (NVSDK_NGX_PerfQuality_Value)acre_cfg_perfquality();
+        // 1:1 means this is DLAA on the post-tonemap image, not an upscale.
+        bool one_to_one = (inW == outW && inH == outH);
+        cp.Feature.InPerfQualityValue = one_to_one
+            ? NVSDK_NGX_PerfQuality_Value_DLAA
+            : (NVSDK_NGX_PerfQuality_Value)acre_cfg_perfquality();
+        // LDR post-tonemap input: no IsHDR, no AutoExposure, no exposure texture --
+        // exactly the flag set CSP's working integration uses (createFlags = 0x2).
         cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
         NVSDK_NGX_Result r = NGX_D3D11_CREATE_DLSS_EXT(ctx, &g_up[eye], g_up_params[eye], &cp);
         acre_log("  ngx: CreateUpscale[eye %d] %ux%u->%ux%u -> 0x%08X (%ls)",

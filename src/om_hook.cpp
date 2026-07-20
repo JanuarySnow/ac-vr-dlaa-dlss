@@ -16,6 +16,7 @@ extern "C" void acre_dlss_inplace(ID3D11Device *dev, ID3D11DeviceContext *ctx,
 extern "C" void acre_up_capture_depth(ID3D11DeviceContext *ctx, ID3D11Texture2D *depth, int eye);
 extern "C" int acre_cfg_mode(void);
 extern "C" int acre_cfg_jitter(void);
+extern "C" int acre_cfg_ldr(void);
 extern "C" long acre_present_count(void);   // frame clock, in dxgi_hook.cpp
 extern "C" void acre_diag_hooks(int ok);
 extern "C" void acre_diag_scene(unsigned w, unsigned h, unsigned samples, unsigned arraysize);
@@ -24,7 +25,9 @@ extern "C" void acre_diag_matrices(const float *cb, uintptr_t cam);
 extern "C" void acre_diag_jitter_subs(int e0, int e1);
 extern "C" int acre_cap_active(void);
 extern "C" void acre_cap_in(ID3D11Device *, ID3D11DeviceContext *, int, ID3D11Texture2D *);
-extern "C" void acre_cap_mark(int eye);
+extern "C" void acre_cap_endframe(void);
+extern "C" void acre_cap_eyes(ID3D11Device *, ID3D11DeviceContext *,
+                              ID3D11Texture2D *, ID3D11Texture2D *);
 
 static uintptr_t deref(uintptr_t p, uintptr_t off);   // defined at file scope below
 
@@ -168,24 +171,38 @@ volatile LONG g_inflight = 0;               // guard against re-entrancy
 bool g_shadow_valid = false;                 // jitter CB built for current scene (fwd)
 void advance_jitter();                       // defined in the jitter section
 extern int g_jitter_on;                      // ditto
+extern volatile LONG g_tf_seen, g_tf_miss;   // jitter-coverage census, ditto
+extern int g_tf_nptr;
 
 // Frame clock: reset the eye counter off the Present count, which works on any headset.
 // (Detecting frame start by mirror texture width only worked on the null driver.)
 long g_last_frame = -1;
 volatile LONG g_sub_n[2] = {0, 0};   // shadow-CB substitutions per eye, this frame
-void frame_tick() {
+void frame_tick(ID3D11DeviceContext *ctx) {
     long pc = acre_present_count();
     if (pc != g_last_frame) {
+        // previous frame's post-processing has landed in renderEye by now
+        if (acre_cap_active() && g_om_dev && g_eye_tex[0] && g_eye_tex[1])
+            acre_cap_eyes(g_om_dev, ctx, (ID3D11Texture2D *)g_eye_tex[0],
+                          (ID3D11Texture2D *)g_eye_tex[1]);
         if (g_last_frame >= 0 && g_dispatched[0] && g_jitter_on == 1)
             acre_diag_jitter_subs((int)g_sub_n[0], (int)g_sub_n[1]);
-        if (!g_stereo && g_dispatched[0])
-            acre_cap_mark(1);       // mono: single dispatch per frame; close capture frame
+        acre_cap_endframe();        // advances the capture pair state (mono and stereo)
         g_sub_n[0] = g_sub_n[1] = 0;
         g_snap_done[0] = g_snap_done[1] = false;
         g_expected_eye = 0;
         g_dispatched[0] = g_dispatched[1] = false;
         g_last_frame = pc; g_eye_counter = 0; advance_jitter();
         update_stereo();
+        static long jf = 0;
+        if (g_jitter_on == 1 && (++jf % 300) == 0) {
+            acre_log("  jitcov: transform-CB binds=%ld unsubstituted=%ld (%.1f%%) "
+                     "distinct CB objects=%d",
+                     (long)g_tf_seen, (long)g_tf_miss,
+                     g_tf_seen ? 100.0 * g_tf_miss / g_tf_seen : 0.0, g_tf_nptr);
+            InterlockedExchange(&g_tf_seen, 0);
+            InterlockedExchange(&g_tf_miss, 0);
+        }
     }
 }
 
@@ -233,16 +250,20 @@ void STDMETHODCALLTYPE hkOM(ID3D11DeviceContext *ctx, UINT n,
                             ID3D11DepthStencilView *dsv) {
     LONG seq = InterlockedIncrement(&g_seq);
     // re-read each call so the ini hot-reload works
+    // ldr: DLAA at the submit point on the post-tonemap eye image (CSP's arrangement)
+    // rather than in-place on the HDR scene. Reuses the submit path wholesale -- it
+    // already needs this eye's depth snapshotted before the next eye overwrites it.
     int mode = acre_cfg_mode();
-    g_upscale_mode = (mode == 2) ? 1 : 0;
-    g_dlss_enabled = (mode == 1);
+    int ldr = acre_cfg_ldr();
+    g_upscale_mode = (mode == 2 || (mode == 1 && ldr)) ? 1 : 0;
+    g_dlss_enabled = (mode == 1 && !ldr);
 
     // ---- Track scene target + frame/eye landmarks (both DLAA and upscale modes; also
     // with mode=off while a capture is active, for no-DLAA reference frames) ----
     if ((g_dlss_enabled || g_upscale_mode || acre_cap_active()) &&
         !InterlockedCompareExchange(&g_inflight, 0, 0)) {
         if (n > 0 && rtvs) {
-            frame_tick();                          // reset eye counter once per frame (Present clock)
+            frame_tick(ctx);                       // reset eye counter once per frame (Present clock)
             ID3D11Texture2D *ct = tex_of_rtv(rtvs[0]);
             ID3D11Texture2D *dt = tex_of_dsv(dsv);
             // renderEye[0] bound as RT = eye 0's tonemap = eye 0 fully composed.
@@ -261,8 +282,22 @@ void STDMETHODCALLTYPE hkOM(ID3D11DeviceContext *ctx, UINT n,
                 int rh = *reinterpret_cast<int *>(g_cam + 3948);
                 if (cd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && rw > 0 &&
                     (int)cd.Width == rw && (int)cd.Height == rh) {
-                    g_scene_color = ct; g_scene_depth = dt; g_scene_dirty = true;
-                    g_shadow_valid = false;        // rebuild jittered CB for this eye
+                    g_scene_color = ct; g_scene_depth = dt;
+                    // Only arm dirty/rebuild-shadow while THIS eye hasn't dispatched yet.
+                    // CSP rebinds the scene texture repeatedly during post-processing; once
+                    // the eye has genuinely dispatched, nothing clears g_scene_dirty again
+                    // (the PSSRV dispatch path now refuses a second run for the same eye),
+                    // so leaving this unconditional left g_shadow_valid=false for the rest
+                    // of that eye's draws -- every subsequent VSSetConstantBuffers call
+                    // re-ran the jitter shadow-CB rebuild (2 CopyResource + a CS dispatch +
+                    // 6 state get/sets), and trusted whatever 320-byte buffer sat at the
+                    // cached VS slot as "the transform CB" without re-validating it. Tanked
+                    // framerate and could jitter/corrupt unrelated draws (shadow maps
+                    // included) for however long that window stayed open.
+                    if (!g_dispatched[g_expected_eye]) {
+                        g_scene_dirty = true;
+                        g_shadow_valid = false;    // rebuild jittered CB for this eye
+                    }
                     acre_diag_scene(cd.Width, cd.Height, cd.SampleDesc.Count, cd.ArraySize);
                 }
             }
@@ -272,6 +307,29 @@ void STDMETHODCALLTYPE hkOM(ID3D11DeviceContext *ctx, UINT n,
             g_in_scene = (g_scene_color && ct == g_scene_color);
         } else {
             g_in_scene = false;
+        }
+    }
+
+    // Motion-vector target hunt. CSP's monitor-mode DLSS is fed an R16G16_FLOAT texture
+    // with bind=0x28 (RENDER_TARGET|SHADER_RESOURCE), i.e. it is rendered, so it passes
+    // through here. If the same shape appears in VR, CSP is producing real per-object
+    // motion vectors we could consume instead of synthesising camera-only ones from
+    // depth -- which is the ceiling on our current quality.
+    if (n > 0 && rtvs) {
+        static unsigned seen_w[8], seen_h[8];
+        static int seen_n = 0;
+        for (UINT i = 0; i < n; i++) {
+            unsigned w = 0, h = 0, f = 0;
+            describe_rtv(rtvs[i], w, h, f);
+            if (f != DXGI_FORMAT_R16G16_FLOAT || w < 512) continue;
+            bool known = false;
+            for (int k = 0; k < seen_n; k++)
+                if (seen_w[k] == w && seen_h[k] == h) { known = true; break; }
+            if (!known && seen_n < 8) {
+                seen_w[seen_n] = w; seen_h[seen_n] = h; seen_n++;
+                acre_log("  mvhunt: R16G16_FLOAT RENDER TARGET bound %ux%u slot=%u res=%p "
+                         "— candidate motion-vector buffer", w, h, i, res_of_rtv(rtvs[i]));
+            }
         }
     }
 
@@ -316,6 +374,15 @@ int  g_transform_slot = -1;                  // VS slot of the transform CB (fou
 bool g_transform_found = false;
 float g_jitter_px[2] = {0, 0};               // this frame's jitter, pixels
 unsigned g_jframe = 0;
+
+// Jitter COVERAGE diagnostic. g_transform_ptr is latched when the shadow is built (once
+// per eye). If CSP rotates among several transform-CB objects, later draws bind a
+// different pointer, miss the substitution, and render UNJITTERED while the rest of the
+// scene is jittered -- DLSS then rocks those elements back and forth between sample
+// positions. Counts binds at the transform slot vs. how many actually got substituted.
+volatile LONG g_tf_seen = 0, g_tf_miss = 0;
+void *g_tf_ptrs[8];
+int g_tf_nptr = 0;
 
 float halton(unsigned i, unsigned b) {
     float f = 1, r = 0;
@@ -453,6 +520,22 @@ void STDMETHODCALLTYPE hkVSCB(ID3D11DeviceContext *ctx, UINT start, UINT num,
         InterlockedExchange(&g_inflight, 0);
     }
 
+    // coverage census: is every transform-CB bind actually getting the jittered shadow?
+    if (g_jitter_on && g_in_scene && g_transform_found && bufs) {
+        int idx = g_transform_slot - (int)start;
+        if (idx >= 0 && idx < (int)num && bufs[idx]) {
+            D3D11_BUFFER_DESC bd; bufs[idx]->GetDesc(&bd);
+            if (bd.ByteWidth == 320) {
+                InterlockedIncrement(&g_tf_seen);
+                if (bufs[idx] != g_transform_ptr) InterlockedIncrement(&g_tf_miss);
+                bool known = false;
+                for (int i = 0; i < g_tf_nptr; i++)
+                    if (g_tf_ptrs[i] == bufs[idx]) { known = true; break; }
+                if (!known && g_tf_nptr < 8) g_tf_ptrs[g_tf_nptr++] = bufs[idx];
+            }
+        }
+    }
+
     // swap in the shadow whenever CSP binds its transform CB, scene pass only
     if (g_jitter_on && g_in_scene && g_shadow_valid && g_shadow_cb && bufs && num > 0 &&
         !InterlockedCompareExchange(&g_inflight, 0, 0)) {
@@ -503,7 +586,6 @@ void STDMETHODCALLTYPE hkPSSRV(ID3D11DeviceContext *ctx, UINT start, UINT num,
                 if (!g_dlss_enabled && !g_upscale_mode) {
                     // mode=off capture: dump the raw scene as the reference image
                     acre_cap_in(g_om_dev, ctx, eye, g_scene_color);
-                    acre_cap_mark(eye);
                 } else if (g_upscale_mode) {
                     acre_up_capture_depth(ctx, g_scene_depth, eye);   // for submit upscale
                 } else {
@@ -546,6 +628,11 @@ extern "C" void acre_install_om_hook(ID3D11DeviceContext *ctx) {
     uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
     g_mod_base = base;
     ctx->GetDevice(&g_om_dev);            // for creating our resources
+    // The camera walk resolves a StereoCameraVive. In monitor mode those pointers are
+    // non-null but not that type, so reading viveData off them access-violates and the
+    // vtable hooks below never got installed (the caller's SEH guard swallowed it, so it
+    // looked like "no data" rather than a crash). Guard the walk; hooks install either way.
+    __try {
     uintptr_t pyi = deref(base, 0x1559AF0);
     if (pyi) {
         uintptr_t cam = deref(deref(deref(pyi, 0x58), 392), 280);
@@ -561,6 +648,10 @@ extern "C" void acre_install_om_hook(ID3D11DeviceContext *ctx) {
                 acre_log("  OM: viveData[%d].renderEye tex=%p", eye, g_eye_tex[eye]);
             }
         }
+    }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_cam = 0;
+        acre_log("  OM: no VR camera (monitor mode?) — hooks still installed for spying");
     }
 
     void **vt = *reinterpret_cast<void ***>(ctx);

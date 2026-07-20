@@ -281,6 +281,75 @@ bool ip_init(ID3D11Device *dev, ID3D11Texture2D *color) {
     return true;
 }
 
+// Reactive / bias-current-colour mask for the DLAA path.
+//
+// The NGX spy showed CSP's own working DLSS integration supplies a full-res R8_UNORM
+// bias mask on every evaluate, while we supplied none -- and a ground-truth comparison
+// measured our output holding only ~0.34x the temporal variation of a supersampled
+// reference, i.e. over-smoothing. The mask is the documented lever for "distrust the
+// accumulated history at these pixels", which is exactly that failure.
+ID3D11ComputeShader *g_ip_react_cs = nullptr;
+ID3D11Texture2D *g_ip_mask = nullptr;
+ID3D11UnorderedAccessView *g_ip_mask_uav = nullptr;
+ID3D11Buffer *g_ip_mask_cb = nullptr;
+ID3D11ShaderResourceView *g_ip_mv_srv = nullptr;
+ID3D11Texture2D *g_ip_prev[2] = {nullptr, nullptr};
+ID3D11ShaderResourceView *g_ip_prev_srv[2] = {nullptr, nullptr};
+ID3D11ShaderResourceView *g_ip_cur_srv = nullptr;
+void *g_ip_cur_for = nullptr;
+struct IpMaskCB { float dim[2]; float scale; float pad; };
+
+bool ip_react_init(ID3D11Device *dev) {
+    if (g_ip_react_cs) return true;
+    if (FAILED(dev->CreateComputeShader(g_reactive_mask_cs, sizeof(g_reactive_mask_cs),
+                                        nullptr, &g_ip_react_cs)))
+        { acre_log("  ip: reactive CS failed"); return false; }
+    if (!make_tex(dev, g_ip_w, g_ip_h, DXGI_FORMAT_R8_UNORM, &g_ip_mask, &g_ip_mask_uav))
+        { acre_log("  ip: mask tex failed"); return false; }
+    dev->CreateShaderResourceView(g_ip_mv, nullptr, &g_ip_mv_srv);
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = sizeof(IpMaskCB); bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(dev->CreateBuffer(&bd, nullptr, &g_ip_mask_cb))) return false;
+    acre_log("  ip: reactive mask ready %ux%u", g_ip_w, g_ip_h);
+    return true;
+}
+
+// Returns the mask to hand DLSS, or null on the first frame for this eye (no history).
+ID3D11Texture2D *ip_reactive(ID3D11Device *dev, ID3D11DeviceContext *ctx,
+                             ID3D11Texture2D *color, int eye) {
+    if (!acre_cfg_reactive() || !ip_react_init(dev)) return nullptr;
+    if (!g_ip_cur_srv || g_ip_cur_for != color) {
+        if (g_ip_cur_srv) g_ip_cur_srv->Release();
+        if (FAILED(dev->CreateShaderResourceView(color, nullptr, &g_ip_cur_srv))) return nullptr;
+        g_ip_cur_for = color;
+    }
+    if (!g_ip_prev[eye]) {
+        D3D11_TEXTURE2D_DESC d; color->GetDesc(&d);
+        d.BindFlags = D3D11_BIND_SHADER_RESOURCE; d.MiscFlags = 0;
+        if (FAILED(dev->CreateTexture2D(&d, nullptr, &g_ip_prev[eye]))) return nullptr;
+        dev->CreateShaderResourceView(g_ip_prev[eye], nullptr, &g_ip_prev_srv[eye]);
+        ctx->CopyResource(g_ip_prev[eye], color);      // seed; no valid history yet
+        return nullptr;
+    }
+    IpMaskCB mc = {{(float)g_ip_w, (float)g_ip_h}, acre_cfg_mask_scale(), 0.f};
+    D3D11_MAPPED_SUBRESOURCE mm;
+    if (SUCCEEDED(ctx->Map(g_ip_mask_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mm))) {
+        memcpy(mm.pData, &mc, sizeof(mc)); ctx->Unmap(g_ip_mask_cb, 0);
+    }
+    ID3D11ShaderResourceView *srvs[3] = {g_ip_cur_srv, g_ip_prev_srv[eye], g_ip_mv_srv};
+    ctx->CSSetShader(g_ip_react_cs, nullptr, 0);
+    ctx->CSSetConstantBuffers(0, 1, &g_ip_mask_cb);
+    ctx->CSSetShaderResources(0, 3, srvs);
+    ctx->CSSetUnorderedAccessViews(0, 1, &g_ip_mask_uav, nullptr);
+    ctx->Dispatch((g_ip_w + 7) / 8, (g_ip_h + 7) / 8, 1);
+    ID3D11UnorderedAccessView *nu = nullptr; ctx->CSSetUnorderedAccessViews(0, 1, &nu, nullptr);
+    ID3D11ShaderResourceView *ns[3] = {nullptr, nullptr, nullptr};
+    ctx->CSSetShaderResources(0, 3, ns);
+    ctx->CopyResource(g_ip_prev[eye], color);          // history for next frame
+    return g_ip_mask;
+}
+
 bool ip_depth_srv(ID3D11Device *dev, ID3D11Texture2D *depth) {
     if (g_ip_depth_srv && g_ip_depth_for == depth) return true;
     if (g_ip_depth_srv) { g_ip_depth_srv->Release(); g_ip_depth_srv = nullptr; }
@@ -424,11 +493,15 @@ extern "C" void acre_dlss_inplace(ID3D11Device *dev, ID3D11DeviceContext *ctx,
         }
     }
 
+    // built after the MV dispatch: the mask shader consumes this frame's motion vectors
+    ID3D11Texture2D *bias_mask = ip_reactive(dev, ctx, color, eye);
+
     NVSDK_NGX_D3D11_DLSS_Eval_Params ep = {};
     ep.Feature.pInColor = color;
     ep.Feature.pInOutput = g_ip_out;
     ep.pInDepth = depth;
     ep.pInMotionVectors = g_ip_mv;
+    ep.pInBiasCurrentColorMask = bias_mask;
     float jx = 0, jy = 0;
     reported_jitter(&jx, &jy);
     ep.InJitterOffsetX = jx;

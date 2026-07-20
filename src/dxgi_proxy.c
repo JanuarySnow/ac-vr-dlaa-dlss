@@ -8,6 +8,7 @@
 
 void acre_start_hook(void);*/
 void acre_cfg_load(void);
+void acre_ngx_spy_start_early(void);
 
 void acre_log(const char *fmt, ...) {
     char path[MAX_PATH];
@@ -63,6 +64,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
         log_module("openvr_api.dll");
         log_module("nvngx_dlss.dll");
         acre_cfg_load();     /* read acre.ini */
+        acre_ngx_spy_start_early();  /* must beat CSP's DLSS CreateFeature */
         acre_start_hook();   /* defers all D3D11 work to a thread */
         break;
     }

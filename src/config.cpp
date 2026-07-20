@@ -26,6 +26,12 @@ struct Cfg {
     int  reactive = 1;
     float mask_scale = 3.0f;
     int  auto_exposure = 0;
+    int  mv_lowres = 1;      // MVLowRes create flag; 1 = current behaviour
+    int  ngx_spy = 0;        // hook NGX to observe CSP's own DLSS configuration
+    // Run DLAA on the post-tonemap LDR eye image instead of the pre-tonemap HDR scene,
+    // which is what CSP's working flat-screen integration does (its colour/output are
+    // RGBA8 and it sets neither IsHDR nor an exposure texture).
+    int  ldr = 0;
     float sharpness = 0.0f;
     bool loaded = false;
     FILETIME mtime = {};        // last seen acre.ini write time
@@ -102,6 +108,9 @@ void load() {
         else if (!_stricmp(key, "reactive_mask")) g.reactive = atoi(val);
         else if (!_stricmp(key, "mask_scale"))    g.mask_scale = (float)atof(val);
         else if (!_stricmp(key, "auto_exposure")) g.auto_exposure = atoi(val);
+        else if (!_stricmp(key, "mv_lowres"))    g.mv_lowres = atoi(val);
+        else if (!_stricmp(key, "ngx_spy"))      g.ngx_spy = atoi(val);
+        else if (!_stricmp(key, "ldr"))          g.ldr = atoi(val);
         else if (!_stricmp(key, "sharpness"))     g.sharpness = (float)atof(val);
     }
     fclose(f);
@@ -148,4 +157,7 @@ extern "C" int   acre_cfg_mv_flip(void)     { return cfg().mv_flip; }
 extern "C" int   acre_cfg_reactive(void)    { return cfg().reactive; }
 extern "C" float acre_cfg_mask_scale(void)  { return cfg().mask_scale; }
 extern "C" int   acre_cfg_auto_exposure(void) { return cfg().auto_exposure; }
+extern "C" int   acre_cfg_mv_lowres(void)     { return cfg().mv_lowres; }
+extern "C" int   acre_cfg_ngx_spy(void)       { return cfg().ngx_spy; }
+extern "C" int   acre_cfg_ldr(void)           { return cfg().ldr; }
 extern "C" float acre_cfg_sharpness(void)   { return cfg().sharpness; }

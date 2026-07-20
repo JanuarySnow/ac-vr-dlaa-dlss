@@ -171,7 +171,10 @@ extern "C" void acre_diag_scene(unsigned w, unsigned h, unsigned samples, unsign
     g.scene_array = arraysize;
     acre_log("  chk: %s scene target found %ux%u samples=%u arraysize=%u",
              tag(samples == 1 && arraysize == 1), w, h, samples, arraysize);
-    if (samples > 1)
+    if (samples > 1 && acre_cfg_mode() == 0)
+        acre_log("  chk: [ok] scene target is %ux MSAA and mode=off — reference capture, "
+                 "not a misconfiguration", samples);
+    else if (samples > 1)
         acre_log("  chk: [XX] scene target is %ux MSAA — DLAA cannot run. "
                  "Turn Anti-aliasing off in AC / Content Manager video settings", samples);
     if (arraysize > 1)

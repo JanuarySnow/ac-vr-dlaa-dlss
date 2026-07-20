@@ -15,6 +15,9 @@ extern "C" void acre_cfg_poll(void);
 extern "C" float acre_cfg_render_scale(void);
 extern "C" void acre_cap_poll(void);
 extern "C" void acre_cap_tick(void);
+extern "C" int acre_cap_active(void);
+extern "C" void acre_ngx_spy_install(void);
+extern "C" void acre_mvhunt_install(ID3D11Device *dev);
 extern "C" void acre_dlss_frame(ID3D11Device *dev, ID3D11DeviceContext *ctx, uintptr_t cam);
 extern "C" void acre_install_om_hook(ID3D11DeviceContext *ctx);
 extern "C" void acre_diag_preflight(void);
@@ -22,6 +25,8 @@ extern "C" void acre_diag_tick(void);
 extern "C" bool acre_try_install_submit_hook(void);
 extern "C" bool acre_install_res_hook(void);
 extern "C" int acre_cfg_mode(void);
+extern "C" int acre_cfg_ldr(void);
+extern "C" int acre_cfg_ngx_spy(void);
 
 namespace {
 
@@ -138,7 +143,11 @@ static uintptr_t live_camera() {
 
 static void frame_once(IDXGISwapChain *sc) {
     uintptr_t cam = live_camera();
-    if (!cam) return;
+    // live_camera() resolves the VR StereoCameraVive, so it is null in monitor mode and
+    // this early-out kept every OM hook VR-only. With ngx_spy on we still want the hooks
+    // installed there, to observe how CSP's working flat-screen path renders (its motion
+    // vectors in particular). Normal users are unaffected: ngx_spy defaults to 0.
+    if (!cam && !acre_cfg_ngx_spy()) return;
 
     if (!g_dev) {                            // first live frame
         if (FAILED(sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void **>(&g_dev))) || !g_dev)
@@ -152,13 +161,21 @@ static void frame_once(IDXGISwapChain *sc) {
     int mode = acre_cfg_mode();               // 0 off, 1 dlaa, 2 dlss
     static bool ngx_ready = false, om_installed = false;
     if (mode != 0 && !ngx_ready) ngx_ready = acre_ngx_init(g_dev);
-    if (ngx_ready && !om_installed) { acre_install_om_hook(g_ctx); om_installed = true; }
-    if (mode == 1 && ngx_ready) {             // DLAA: create
+    // The OM hook does the scene tracking, which a mode=off reference capture needs just
+    // as much as DLAA does. Gating it purely on ngx_ready meant a session launched cold
+    // in mode=off never installed it, so captures armed and then silently caught nothing.
+    if (!om_installed && (ngx_ready || acre_cap_active() || acre_cfg_ngx_spy())) {
+        acre_install_om_hook(g_ctx);
+        om_installed = true;
+    }
+    int ldr = acre_cfg_ldr();
+    if (!cam) return;                          // rest of the pipeline needs the VR camera
+    if (mode == 1 && !ldr && ngx_ready) {      // DLAA in-place on the HDR scene
         unsigned w = *reinterpret_cast<int *>(cam + 3944);
         unsigned h = *reinterpret_cast<int *>(cam + 3948);
         acre_ngx_ensure_dlaa(g_ctx, w, h);
     }
-    if (mode == 2)                            // DLSS upscale
+    if (mode == 2 || (mode == 1 && ldr))      // DLSS upscale, or DLAA on the LDR eye
         acre_try_install_submit_hook();
 }
 
@@ -184,8 +201,18 @@ HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain *sc, UINT sync, UINT flags) {
         }
         t0 = now;
     }
+    if (n == 1) {   // earliest point we can reach a device; track load is still ahead
+        ID3D11Device *d = nullptr;
+        if (SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void **>(&d))) && d) {
+            acre_mvhunt_install(d);
+            d->Release();
+        }
+    }
     if ((n % 30) == 0) { acre_cfg_poll(); acre_cap_poll(); }   // ini hot-reload + capture trigger
     acre_cap_tick();                        // capture pair writes/cooldown
+    // Retry every frame until it takes: CSP creates its DLSS feature early, and a lazy
+    // retry meant the hook landed after CreateFeature and we only ever saw Evaluate.
+    acre_ngx_spy_install();
     if (n >= 120) {                         // a coupla seconds in, scene loaded
         frame_guarded(sc);
         acre_diag_tick();
@@ -264,8 +291,10 @@ DWORD WINAPI init_thread(LPVOID) {
     // Install the render-res reduction hook first up, it must be in place
     // before AC builds StereoCameraVive . It only inline-hooks an
     // acs.exe function via MinHook
-    if (acre_cfg_mode() == 2 ||
-        (acre_cfg_mode() == 1 && acre_cfg_render_scale() > 1.005f)) acre_install_res_hook();
+    // mode 2 always reduces res; modes 1 and 0 only when render_scale asks for
+    // supersampling (mode 0 + render_scale is the ground-truth reference capture)
+    if (acre_cfg_mode() == 2 || acre_cfg_render_scale() > 1.005f)
+        acre_install_res_hook();
     // Let AC finish creating its own device/swapchain first avoids racing its init.
     Sleep(4000);
     acre_log("  hook: init thread starting");

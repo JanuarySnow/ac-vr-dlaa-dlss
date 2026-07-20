@@ -34,15 +34,26 @@ echo [4/5] assembling thunks
 ml64 /nologo /c /Fo"%OUT%\thunks.obj" "%HERE%thunks.asm" >nul
 if errorlevel 1 ( echo ERROR: ml64 failed & exit /b 1 )
 
+rem Offline investigation modules (frame capture, NGX/CSP observation) are not part of
+rem the shipped mod and live in the research repo. Point ACRE_RESEARCH_DIR at that
+rem folder to build them in; otherwise no-op stubs are compiled so the call sites link.
+set RESEARCH_SRC="%HERE%research_stubs.cpp"
+set RESEARCH_DEF=
+if defined ACRE_RESEARCH_DIR if exist "%ACRE_RESEARCH_DIR%\cap.cpp" (
+  set RESEARCH_SRC="%ACRE_RESEARCH_DIR%\cap.cpp" "%ACRE_RESEARCH_DIR%\ngx_spy.cpp"
+  set RESEARCH_DEF=/DACRE_RESEARCH
+  echo     research build: including cap.cpp + ngx_spy.cpp from %ACRE_RESEARCH_DIR%
+)
+
 echo [5/5] compiling + linking dxgi.dll
 rem Every "%HERE%" / "%OUT%\" needs a trailing '.' or filename: a backslash before the
 rem closing quote escapes it, and cl then swallows the rest of the command line.
 set NGX=%HERE%..\vendor\DLSS
 set MH=%HERE%..\vendor\minhook
 rem MinHook (C, no CRT security warnings) built alongside our sources.
-cl /nologo /LD /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS /I"%HERE%." /I"%NGX%\include" /I"%MH%\include" ^
+cl /nologo /LD /W4 /O2 /MT %RESEARCH_DEF% /D_CRT_SECURE_NO_WARNINGS /I"%HERE%." /I"%NGX%\include" /I"%MH%\include" ^
    /Fo%OUT%\ /Fe"%OUT%\dxgi.dll" ^
-   "%HERE%dxgi_proxy.c" "%HERE%dxgi_hook.cpp" "%HERE%ngx_dlss.cpp" "%HERE%dlss_pass.cpp" "%HERE%om_hook.cpp" "%HERE%submit_hook.cpp" "%HERE%res_hook.cpp" "%HERE%config.cpp" "%HERE%diag.cpp" "%HERE%cap.cpp" ^
+   "%HERE%dxgi_proxy.c" "%HERE%dxgi_hook.cpp" "%HERE%ngx_dlss.cpp" "%HERE%dlss_pass.cpp" "%HERE%om_hook.cpp" "%HERE%submit_hook.cpp" "%HERE%res_hook.cpp" "%HERE%config.cpp" "%HERE%diag.cpp" %RESEARCH_SRC% ^
    "%MH%\src\buffer.c" "%MH%\src\hook.c" "%MH%\src\trampoline.c" "%MH%\src\hde\hde64.c" ^
    "%OUT%\thunks.obj" ^
    /link /DEF:"%HERE%exports.def" "%OUT%\dxgi_real.lib" ^

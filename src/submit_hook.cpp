@@ -18,6 +18,8 @@ extern "C" float acre_cfg_upscale(void);
 extern "C" int  acre_cfg_out_w(void);
 extern "C" int  acre_cfg_out_h(void);
 extern "C" bool acre_res_native(unsigned *w, unsigned *h);
+extern "C" int  acre_cfg_ldr(void);
+extern "C" int  acre_cfg_mode(void);
 
 namespace {
 
@@ -92,7 +94,16 @@ int STDMETHODCALLTYPE hkSubmit(void *self, int eEye, const Texture_t *tex,
         if (dev) {
             ID3D11DeviceContext *ctx = nullptr; dev->GetImmediateContext(&ctx);
             if (ctx) {
-                if (!g_up_ready) {
+                if (!g_up_ready && acre_cfg_ldr() && acre_cfg_mode() == 1) {
+                    // DLAA on the post-tonemap eye image: 1:1, no resolution change.
+                    D3D11_TEXTURE2D_DESC d; src->GetDesc(&d);
+                    g_out_w = d.Width; g_out_h = d.Height;
+                    g_up_ready = acre_ngx_create_upscale(ctx, d.Width, d.Height,
+                                                         g_out_w, g_out_h);
+                    if (g_up_ready)
+                        acre_log("  ldr: DLAA on renderEye %ux%u (1:1, post-tonemap)",
+                                 d.Width, d.Height);
+                } else if (!g_up_ready) {
                     D3D11_TEXTURE2D_DESC d; src->GetDesc(&d);
                     // target = ini override, else the native res_hook remembered, else factor
                     unsigned nw = 0, nh = 0;

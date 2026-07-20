@@ -58,8 +58,13 @@ void STDMETHODCALLTYPE hkGetRRTS(void *self, uint32_t *pw, uint32_t *ph) {
         g_reduced_w = rw; g_reduced_h = rh; g_res_active = true;
         acre_log("  res: native %ux%u -> render %ux%u (dlss upscale %.2f)",
                  g_native_w, g_native_h, rw, rh, f);
-    } else if (acre_cfg_mode() == 1 && g_native_w && g_native_h &&
+    } else if ((acre_cfg_mode() == 1 || acre_cfg_mode() == 0) && g_native_w && g_native_h &&
                acre_cfg_render_scale() > 1.005f) {
+        // mode=0 is allowed here so a supersampled GROUND-TRUTH reference can be captured
+        // (render_scale 2.0 + MSAA + no DLAA, downsampled offline). Reference-free
+        // sharpness metrics cannot tell aliasing from detail -- they rated a visibly
+        // stair-stepped image as sharper -- so scoring against a real reference is the
+        // only way to measure quality changes honestly.
         // dlaa supersampling: render ABOVE native and let DLAA run at that size. The
         // compositor downsamples to the panel, so g_res_active stays false — there is no
         // submit-time upscale to do.
