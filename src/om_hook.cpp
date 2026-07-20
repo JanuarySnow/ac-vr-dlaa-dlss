@@ -194,6 +194,7 @@ void frame_tick(ID3D11DeviceContext *ctx) {
         g_dispatched[0] = g_dispatched[1] = false;
         g_last_frame = pc; g_eye_counter = 0; advance_jitter();
         update_stereo();
+#ifdef ACRE_RESEARCH
         static long jf = 0;
         if (g_jitter_on == 1 && (++jf % 300) == 0) {
             acre_log("  jitcov: transform-CB binds=%ld unsubstituted=%ld (%.1f%%) "
@@ -203,6 +204,7 @@ void frame_tick(ID3D11DeviceContext *ctx) {
             InterlockedExchange(&g_tf_seen, 0);
             InterlockedExchange(&g_tf_miss, 0);
         }
+#endif
     }
 }
 
@@ -310,11 +312,13 @@ void STDMETHODCALLTYPE hkOM(ID3D11DeviceContext *ctx, UINT n,
         }
     }
 
+#ifdef ACRE_RESEARCH
     // Motion-vector target hunt. CSP's monitor-mode DLSS is fed an R16G16_FLOAT texture
     // with bind=0x28 (RENDER_TARGET|SHADER_RESOURCE), i.e. it is rendered, so it passes
     // through here. If the same shape appears in VR, CSP is producing real per-object
     // motion vectors we could consume instead of synthesising camera-only ones from
     // depth -- which is the ceiling on our current quality.
+    // Research-only: this costs a describe_rtv() on every render-target bind.
     if (n > 0 && rtvs) {
         static unsigned seen_w[8], seen_h[8];
         static int seen_n = 0;
@@ -332,6 +336,7 @@ void STDMETHODCALLTYPE hkOM(ID3D11DeviceContext *ctx, UINT n,
             }
         }
     }
+#endif  // ACRE_RESEARCH
 
     if (n > 0 || dsv) {
         Sig s = {};
@@ -520,7 +525,9 @@ void STDMETHODCALLTYPE hkVSCB(ID3D11DeviceContext *ctx, UINT start, UINT num,
         InterlockedExchange(&g_inflight, 0);
     }
 
-    // coverage census: is every transform-CB bind actually getting the jittered shadow?
+#ifdef ACRE_RESEARCH
+    // Coverage census: is every transform-CB bind actually getting the jittered shadow?
+    // Research-only -- it calls GetDesc() once per constant-buffer bind, i.e. per draw.
     if (g_jitter_on && g_in_scene && g_transform_found && bufs) {
         int idx = g_transform_slot - (int)start;
         if (idx >= 0 && idx < (int)num && bufs[idx]) {
@@ -535,6 +542,7 @@ void STDMETHODCALLTYPE hkVSCB(ID3D11DeviceContext *ctx, UINT start, UINT num,
             }
         }
     }
+#endif  // ACRE_RESEARCH
 
     // swap in the shadow whenever CSP binds its transform CB, scene pass only
     if (g_jitter_on && g_in_scene && g_shadow_valid && g_shadow_cb && bufs && num > 0 &&
