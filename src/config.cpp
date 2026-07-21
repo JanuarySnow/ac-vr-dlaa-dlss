@@ -15,24 +15,39 @@ namespace {
 
 struct Cfg {
     int  mode = 1;              // 0 off, 1 dlaa, 2 dlss (upscale)
-    int  preset = 11;          // DLSS render preset (K=11)
+    int  preset = 12;          // DLSS render preset (L=12)
     float upscale = 1.5f;      // dlss output/input ratio
     float render_scale = 1.0f; // dlaa supersample: render target = native * this
     int  out_w = 0, out_h = 0; // absolute per-eye output target
     int  perfquality = 1;      // NVSDK_NGX_PerfQuality_Value (MaxQuality=1) for dlss
     int  jitter = 1;
+    // Scales the sub-pixel jitter amplitude (both the render offset AND what we report to DLSS,
+    // so they stay consistent). 1.0 = full ±0.5px Halton. Lower values shrink the per-frame
+    // sub-pixel shift, which linearly shrinks how far high-contrast grazing-surface texture edges
+    // (rubber lines, white-line/grass edges) move each frame — the trigger for the road-surface
+    // crawl. Trade: less temporal supersampling detail. 0 = no jitter (== jitter off). Sweet spot
+    // is usually 0.4-0.7. Hot-reloadable.
+    float jitter_scale = 0.1f;
     int  jflip_x = 0, jflip_y = 0;   // sign of InJitterOffset reported to DLSS (calibration)
     int  mv_flip = 0;                // negate motion vectors via InMVScale (calibration)
     int  reactive = 1;
-    float mask_scale = 3.0f;
+    float mask_scale = 1.0f;
     int  auto_exposure = 0;
-    int  mv_lowres = 1;      // MVLowRes create flag; 1 = current behaviour
+    int  mv_lowres = 0;      // MVLowRes create flag
     int  ngx_spy = 0;        // hook NGX to observe CSP's own DLSS configuration
     // Run DLAA on the post-tonemap LDR eye image instead of the pre-tonemap HDR scene,
     // which is what CSP's working flat-screen integration does (its colour/output are
     // RGBA8 and it sets neither IsHDR nor an exposure texture).
-    int  ldr = 0;
-    float sharpness = 0.0f;
+    int  ldr = 1;
+    float sharpness = 0.6f;
+    // Under Single Pass Stereo, reproject motion vectors (1) or zero them (0). Zero-MV is
+    // the safe fallback: both eyes stay fused, only fast motion smears. Reprojection needs
+    // the true per-eye projection (auto-sourced from pHMD) and is still being validated.
+    int  sps_mv = 1;
+    // SPS motion-vector deadband (render px): motion below dead_lo is zeroed, dead_lo..dead_hi
+    // ramps in. Kills phantom tracking-noise MVs that flicker when still; keep well below real
+    // motion (>6px/frame) so it doesn't ghost. 0/0 disables.
+    float sps_dead_lo = 0.0f, sps_dead_hi = 0.0f;   // OFF by default (bandaid; real fix TBD)
     bool loaded = false;
     FILETIME mtime = {};        // last seen acre.ini write time
 } g;
@@ -41,7 +56,7 @@ int preset_from_letter(char c) {
     c = (char)toupper((unsigned char)c);
     if (c >= 'A' && c <= 'G') return 1 + (c - 'A');   // A..G = 1..7
     switch (c) { case 'J': return 10; case 'K': return 11; case 'L': return 12; case 'M': return 13; }
-    return 11;   // default K
+    return 12;   // default L
 }
 
 void set_upscale(const char *v) {
@@ -102,6 +117,11 @@ void load() {
         else if (!_stricmp(key, "output_width"))  g.out_w = atoi(val);
         else if (!_stricmp(key, "output_height")) g.out_h = atoi(val);
         else if (!_stricmp(key, "jitter"))        g.jitter = atoi(val);
+        else if (!_stricmp(key, "jitter_scale")) {
+            g.jitter_scale = (float)atof(val);
+            if (g.jitter_scale < 0.0f) g.jitter_scale = 0.0f;
+            if (g.jitter_scale > 1.0f) g.jitter_scale = 1.0f;
+        }
         else if (!_stricmp(key, "jitter_flip_x")) g.jflip_x = atoi(val);
         else if (!_stricmp(key, "jitter_flip_y")) g.jflip_y = atoi(val);
         else if (!_stricmp(key, "mv_flip"))       g.mv_flip = atoi(val);
@@ -112,12 +132,15 @@ void load() {
         else if (!_stricmp(key, "ngx_spy"))      g.ngx_spy = atoi(val);
         else if (!_stricmp(key, "ldr"))          g.ldr = atoi(val);
         else if (!_stricmp(key, "sharpness"))     g.sharpness = (float)atof(val);
+        else if (!_stricmp(key, "sps_mv"))        g.sps_mv = atoi(val);
+        else if (!_stricmp(key, "sps_dead_lo"))   g.sps_dead_lo = (float)atof(val);
+        else if (!_stricmp(key, "sps_dead_hi"))   g.sps_dead_hi = (float)atof(val);
     }
     fclose(f);
     acre_log("  cfg: mode=%d preset=%d upscale=%.2f render_scale=%.2f out=%dx%d pq=%d jitter=%d "
-             "reactive=%d autoexp=%d sharp=%.2f",
+             "reactive=%d autoexp=%d sharp=%.2f sps_mv=%d",
              g.mode, g.preset, g.upscale, g.render_scale, g.out_w, g.out_h, g.perfquality,
-             g.jitter, g.reactive, g.auto_exposure, g.sharpness);
+             g.jitter, g.reactive, g.auto_exposure, g.sharpness, g.sps_mv);
 }
 
 Cfg &cfg() { if (!g.loaded) load(); return g; }
@@ -151,6 +174,7 @@ extern "C" int   acre_cfg_out_w(void)       { return cfg().out_w; }
 extern "C" int   acre_cfg_out_h(void)       { return cfg().out_h; }
 extern "C" int   acre_cfg_perfquality(void) { return cfg().perfquality; }
 extern "C" int   acre_cfg_jitter(void)      { return cfg().jitter; }
+extern "C" float acre_cfg_jitter_scale(void) { return cfg().jitter_scale; }
 extern "C" int   acre_cfg_jflip_x(void)     { return cfg().jflip_x; }
 extern "C" int   acre_cfg_jflip_y(void)     { return cfg().jflip_y; }
 extern "C" int   acre_cfg_mv_flip(void)     { return cfg().mv_flip; }
@@ -161,3 +185,6 @@ extern "C" int   acre_cfg_mv_lowres(void)     { return cfg().mv_lowres; }
 extern "C" int   acre_cfg_ngx_spy(void)       { return cfg().ngx_spy; }
 extern "C" int   acre_cfg_ldr(void)           { return cfg().ldr; }
 extern "C" float acre_cfg_sharpness(void)   { return cfg().sharpness; }
+extern "C" int   acre_cfg_sps_mv(void)      { return cfg().sps_mv; }
+extern "C" float acre_cfg_sps_dead_lo(void) { return cfg().sps_dead_lo; }
+extern "C" float acre_cfg_sps_dead_hi(void) { return cfg().sps_dead_hi; }

@@ -82,9 +82,73 @@ void dump_output(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *t
     stg->Release();
 }
 
+unsigned fmt_bpp(DXGI_FORMAT f) {
+    switch (f) {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: return 16;
+    default: return 4;   // RGBA8 / R11G11B10 / RGB10A2 etc.
+    }
+}
+
+// Capture the EXACT texture handed to IVRCompositor::Submit — i.e. what the runtime warps
+// onto the lens, which is not necessarily AC's per-eye renderEye. Under SPS the app may
+// submit one double-wide texture with per-eye VRTextureBounds, so the per-eye renderEye we
+// capture elsewhere can look clean while the real submitted image is skewed.
+void dump_submitted(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *tex, int eye) {
+    D3D11_TEXTURE2D_DESC d; tex->GetDesc(&d);
+    D3D11_TEXTURE2D_DESC sd = d;
+    sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0;
+    sd.SampleDesc.Count = 1; sd.SampleDesc.Quality = 0;
+    ID3D11Texture2D *stg = nullptr;
+    if (FAILED(dev->CreateTexture2D(&sd, nullptr, &stg)) || !stg) return;
+    ctx->CopyResource(stg, tex);
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (SUCCEEDED(ctx->Map(stg, 0, D3D11_MAP_READ, 0, &m))) {
+        char path[MAX_PATH];
+        sprintf_s(path, "acre_submit_e%d.raw", eye);
+        FILE *f = nullptr;
+        if (fopen_s(&f, path, "wb") == 0 && f) {
+            unsigned bpp = fmt_bpp(d.Format);
+            unsigned hdr[4] = {d.Width, d.Height, (unsigned)d.Format, bpp};
+            fwrite(hdr, sizeof(hdr), 1, f);
+            for (unsigned y = 0; y < d.Height; y++)
+                fwrite((const BYTE *)m.pData + (size_t)y * m.RowPitch, (size_t)d.Width * bpp, 1, f);
+            fclose(f);
+            acre_log("  SUBMIT dumped eye=%d %ux%u fmt=%d -> %s", eye, d.Width, d.Height, d.Format, path);
+        }
+        ctx->Unmap(stg, 0);
+    }
+    stg->Release();
+}
+
 int STDMETHODCALLTYPE hkSubmit(void *self, int eEye, const Texture_t *tex,
                                const VRTextureBounds_t *bounds, int flags) {
     LONG n = InterlockedIncrement(&g_submit_calls);
+
+    // --- SPS submit diagnostic: log + capture the ACTUAL submitted texture and bounds,
+    // once per eye, a couple seconds in (after DLAA has kicked in). Env-gated so it never
+    // fires in a shipping session. This is the ground truth of what reaches the lens. ---
+    static int subdiag = -1;
+    if (subdiag < 0) subdiag = GetEnvironmentVariableA("ACRE_SUBDIAG", nullptr, 0) ? 1 : 0;
+    static volatile LONG g_sd[2] = {0, 0};
+    if (subdiag && tex && tex->handle && eEye >= 0 && eEye < 2 && n > 240 &&
+        InterlockedCompareExchange(&g_sd[eEye], 1, 0) == 0) {
+        __try {
+            ID3D11Texture2D *s = reinterpret_cast<ID3D11Texture2D *>(tex->handle);
+            D3D11_TEXTURE2D_DESC d; s->GetDesc(&d);
+            acre_log("  SUBMIT eye=%d handle=%p %ux%u fmt=%d smp=%u bounds=[u %.3f..%.3f v %.3f..%.3f] "
+                     "eType=%d flags=0x%x", eEye, tex->handle, d.Width, d.Height, d.Format,
+                     d.SampleDesc.Count, bounds ? bounds->uMin : 0.f, bounds ? bounds->uMax : 1.f,
+                     bounds ? bounds->vMin : 0.f, bounds ? bounds->vMax : 1.f, tex->eType, flags);
+            ID3D11Device *dev = dev_of(s);
+            if (dev) {
+                ID3D11DeviceContext *ctx = nullptr; dev->GetImmediateContext(&ctx);
+                if (ctx) { dump_submitted(dev, ctx, s, eEye); ctx->Release(); }
+                dev->Release();
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
     static volatile LONG g_diag_done = 0;
     if (tex && tex->handle && eEye >= 0 && eEye < 2 && n > 60 && InterlockedCompareExchange(&g_diag_done, 1, 0) == 0)
         submit_diag(reinterpret_cast<ID3D11Texture2D *>(tex->handle), eEye);

@@ -124,12 +124,11 @@ extern "C" void acre_diag_preflight(void) {
 
     g.sps = csp_get("vr_tweaks.ini", "SINGLE_PASS_STEREO", "ENABLED", v, sizeof(v))
                 ? (atoi(v) != 0) : -1;
-    acre_log("  chk: %s CSP Single Pass Stereo = %s%s", tag(g.sps == 0),
-             g.sps < 0 ? "unknown" : g.sps ? "ON" : "off",
-             g.sps == 1 ? "   <- MUST BE OFF: CSP VR settings -> Single Pass Stereo. "
-                          "With SPS on the per-eye scene passes we hook never appear "
-                          "and DLAA stays inactive"
-                        : (g.sps < 0 ? "   (vr_tweaks.ini not readable; CSP default is ON)" : ""));
+    // SPS is now SUPPORTED: the scene renders to one double-wide target and DLAA processes
+    // both eyes at that single pass (see om_hook g_scene_wide). Either state is fine.
+    acre_log("  chk: [ok] CSP Single Pass Stereo = %s%s",
+             g.sps < 0 ? "unknown" : g.sps ? "ON (double-wide DLAA)" : "off (per-eye DLAA)",
+             g.sps < 0 ? "   (vr_tweaks.ini not readable; CSP default is ON — supported)" : "");
 
     g.aa_known = csp_get("graphics_adjustments.ini", "ANTIALIASING", "MODE", v, sizeof(v));
     if (g.aa_known) strncpy_s(g.aa_mode, v, _TRUNCATE);

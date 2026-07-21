@@ -177,6 +177,11 @@ static void frame_once(IDXGISwapChain *sc) {
     }
     if (mode == 2 || (mode == 1 && ldr))      // DLSS upscale, or DLAA on the LDR eye
         acre_try_install_submit_hook();
+    else if (mode == 1) {                      // dlaa: install log-only submit hook to
+        static int subdiag = -1;               // inspect what actually reaches the compositor
+        if (subdiag < 0) subdiag = GetEnvironmentVariableA("ACRE_SUBDIAG", nullptr, 0) ? 1 : 0;
+        if (subdiag) acre_try_install_submit_hook();
+    }
 }
 
 // handle bad pointer

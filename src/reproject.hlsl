@@ -13,7 +13,7 @@ cbuffer ReprojectCB : register(b0)
 {
     row_major float4x4 gReproj;   // clip(cur) -> clip(prev), composed in double on CPU
     float2 gRenderDim;            // (width, height) in pixels
-    float2 gPad;
+    float2 gDead;                 // MV deadband (low, high) px; (0,0) = off (non-SPS path)
 };
 
 Texture2D<float>    gDepth  : register(t0);
@@ -38,5 +38,16 @@ void main(uint3 tid : SV_DispatchThreadID)
     else
         prevUv = uv;   // behind previous camera; no meaningful motion
 
-    gMotion[px] = (prevUv - uv) * gRenderDim;   // render-pixel units, prev - cur
+    float2 mv = (prevUv - uv) * gRenderDim;     // render-pixel units, prev - cur
+
+    // Deadband: with a perfectly still headset the reprojection still yields ~0.5px of
+    // "phantom" motion from per-frame pose-prediction noise. Fed to DLSS alongside jitter it
+    // misaligns the temporal history every frame and the whole image flickers (measured:
+    // reprojection on = 14-17% flicker, off = ~2.5%). Attenuate sub-pixel motion toward zero
+    // — static behaves like MVs-off (stable) while real motion passes through. Smoothstep
+    // avoids a hard judder threshold. (0,0) leaves the non-SPS path untouched.
+    if (gDead.y > 0.0f)
+        mv *= smoothstep(gDead.x, gDead.y, length(mv));
+
+    gMotion[px] = mv;
 }

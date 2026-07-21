@@ -13,9 +13,16 @@ extern "C" void acre_log(const char *fmt, ...);
 extern "C" void acre_dlss_inplace(ID3D11Device *dev, ID3D11DeviceContext *ctx,
                                   ID3D11Texture2D *color, ID3D11Texture2D *depth,
                                   int eye, uintptr_t cam);
+extern "C" void acre_dlss_inplace_sps(ID3D11Device *dev, ID3D11DeviceContext *ctx,
+                                      ID3D11Texture2D *wide_color, ID3D11Texture2D *wide_depth,
+                                      uintptr_t cam);
+extern "C" void acre_sps_capture_depth_submit(ID3D11Device *dev, ID3D11DeviceContext *ctx,
+                                              ID3D11Texture2D *wide_color, ID3D11Texture2D *wide_depth,
+                                              uintptr_t cam);
 extern "C" void acre_up_capture_depth(ID3D11DeviceContext *ctx, ID3D11Texture2D *depth, int eye);
 extern "C" int acre_cfg_mode(void);
 extern "C" int acre_cfg_jitter(void);
+extern "C" float acre_cfg_jitter_scale(void);
 extern "C" int acre_cfg_ldr(void);
 extern "C" long acre_present_count(void);   // frame clock, in dxgi_hook.cpp
 extern "C" void acre_diag_hooks(int ok);
@@ -57,7 +64,11 @@ const char *fmtname(unsigned f) {
 }
 
 // A compact signature so each distinct binding logs once.
-struct Sig { unsigned rw, rh, rf, dw, dh, df; };
+// ra/da (ArraySize) and rs/ds (sample count) are part of the signature, not just the
+// log text: under Single Pass Stereo a 2-slice array target has the SAME width/height
+// as the per-eye target we already match on, so without ArraySize here the two are
+// indistinguishable and the SPS case would silently look normal.
+struct Sig { unsigned rw, rh, rf, ra, rs, dw, dh, df, da, ds; };
 Sig g_seen[64];
 int g_seen_n = 0;
 
@@ -68,8 +79,12 @@ bool seen(const Sig &s) {
     return false;
 }
 
-void describe_rtv(ID3D11RenderTargetView *rtv, unsigned &w, unsigned &h, unsigned &f) {
+// a/s default to 0 so callers that only want w/h/f can pass nothing.
+void describe_rtv(ID3D11RenderTargetView *rtv, unsigned &w, unsigned &h, unsigned &f,
+                  unsigned *a = nullptr, unsigned *s = nullptr) {
     w = h = f = 0;
+    if (a) *a = 0;
+    if (s) *s = 0;
     if (!rtv) return;
     ID3D11Resource *res = nullptr;
     rtv->GetResource(&res);
@@ -77,12 +92,17 @@ void describe_rtv(ID3D11RenderTargetView *rtv, unsigned &w, unsigned &h, unsigne
     ID3D11Texture2D *t = nullptr;
     if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&t)) && t) {
         D3D11_TEXTURE2D_DESC d; t->GetDesc(&d); w = d.Width; h = d.Height; f = d.Format;
+        if (a) *a = d.ArraySize;
+        if (s) *s = d.SampleDesc.Count;
         t->Release();
     }
     res->Release();
 }
-void describe_dsv(ID3D11DepthStencilView *dsv, unsigned &w, unsigned &h, unsigned &f) {
+void describe_dsv(ID3D11DepthStencilView *dsv, unsigned &w, unsigned &h, unsigned &f,
+                  unsigned *a = nullptr, unsigned *s = nullptr) {
     w = h = f = 0;
+    if (a) *a = 0;
+    if (s) *s = 0;
     if (!dsv) return;
     ID3D11Resource *res = nullptr;
     dsv->GetResource(&res);
@@ -90,6 +110,8 @@ void describe_dsv(ID3D11DepthStencilView *dsv, unsigned &w, unsigned &h, unsigne
     ID3D11Texture2D *t = nullptr;
     if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&t)) && t) {
         D3D11_TEXTURE2D_DESC d; t->GetDesc(&d); w = d.Width; h = d.Height; f = d.Format;
+        if (a) *a = d.ArraySize;
+        if (s) *s = d.SampleDesc.Count;
         t->Release();
     }
     res->Release();
@@ -121,6 +143,12 @@ ID3D11Device *g_om_dev = nullptr;
 ID3D11Texture2D *g_scene_color = nullptr;   // CSP's per-eye scene HDR (borrowed ptr)
 ID3D11Texture2D *g_scene_depth = nullptr;
 bool g_scene_dirty = false;                 // scene freshly rendered, not yet DLSS'd
+// Single Pass Stereo: the scene target is one double-wide texture (width = 2*renderWidth)
+// holding both eyes side-by-side, produced in a single instanced pass. When true, the
+// injection point processes BOTH eyes at once (see hkPSSRV) instead of sequencing them
+// across two passes. Detected purely by shape, so it also lights up if a user's CSP is
+// set to a per-eye layout that still presents a double-wide HDR target.
+bool g_scene_wide = false;
 // cam+2512 is per-eye but rewritten before the dispatch point reads it, so both eyes were
 // reprojecting from the same camera (diag showed separation 0.0000 on every frame).
 // Bind-time was too EARLY (kglSetRenderTargets precedes viveRenderPass's view write:
@@ -185,7 +213,10 @@ void frame_tick(ID3D11DeviceContext *ctx) {
         if (acre_cap_active() && g_om_dev && g_eye_tex[0] && g_eye_tex[1])
             acre_cap_eyes(g_om_dev, ctx, (ID3D11Texture2D *)g_eye_tex[0],
                           (ID3D11Texture2D *)g_eye_tex[1]);
-        if (g_last_frame >= 0 && g_dispatched[0] && g_jitter_on == 1)
+        // Under SPS both eyes render in one pass, so every jitter substitution is counted
+        // under eye 0 (g_sub_n[1] stays 0) — that's correct, not the per-eye asymmetry this
+        // diag hunts for. Skip it; the wide path applies one jittered CB to both eyes.
+        if (g_last_frame >= 0 && g_dispatched[0] && g_jitter_on == 1 && !g_scene_wide)
             acre_diag_jitter_subs((int)g_sub_n[0], (int)g_sub_n[1]);
         acre_cap_endframe();        // advances the capture pair state (mono and stereo)
         g_sub_n[0] = g_sub_n[1] = 0;
@@ -247,6 +278,11 @@ void *rtv_resource(ID3D11RenderTargetView *rtv) {
     return r;
 }
 
+// SPS probe: state + entry defined below (before hkVSCB), forward-declared for hkOM.
+extern bool g_sps_scene;
+extern bool g_sps_scene_logged;
+bool sps_probe_on();
+
 void STDMETHODCALLTYPE hkOM(ID3D11DeviceContext *ctx, UINT n,
                             ID3D11RenderTargetView *const *rtvs,
                             ID3D11DepthStencilView *dsv) {
@@ -282,9 +318,15 @@ void STDMETHODCALLTYPE hkOM(ID3D11DeviceContext *ctx, UINT n,
                 // also catches 512x512 reflection probes
                 int rw = *reinterpret_cast<int *>(g_cam + 3944);
                 int rh = *reinterpret_cast<int *>(g_cam + 3948);
-                if (cd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && rw > 0 &&
-                    (int)cd.Width == rw && (int)cd.Height == rh) {
-                    g_scene_color = ct; g_scene_depth = dt;
+                // per-eye (SPS off): width == renderWidth. double-wide (Single Pass Stereo):
+                // width == 2*renderWidth, both eyes side-by-side in one target.
+                bool pereye = rw > 0 && (int)cd.Width == rw && (int)cd.Height == rh;
+                bool wide   = rw > 0 && (int)cd.Width == 2 * rw && (int)cd.Height == rh;
+                if (cd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && (pereye || wide)) {
+                    g_scene_color = ct; g_scene_depth = dt; g_scene_wide = wide;
+                    // under SPS the single pass does both eyes, so arm on the frame's
+                    // wide-dispatch flag (g_dispatched[0]) rather than the per-eye counter.
+                    int guard_eye = wide ? 0 : g_expected_eye;
                     // Only arm dirty/rebuild-shadow while THIS eye hasn't dispatched yet.
                     // CSP rebinds the scene texture repeatedly during post-processing; once
                     // the eye has genuinely dispatched, nothing clears g_scene_dirty again
@@ -296,7 +338,7 @@ void STDMETHODCALLTYPE hkOM(ID3D11DeviceContext *ctx, UINT n,
                     // cached VS slot as "the transform CB" without re-validating it. Tanked
                     // framerate and could jitter/corrupt unrelated draws (shadow maps
                     // included) for however long that window stayed open.
-                    if (!g_dispatched[g_expected_eye]) {
+                    if (!g_dispatched[guard_eye]) {
                         g_scene_dirty = true;
                         g_shadow_valid = false;    // rebuild jittered CB for this eye
                     }
@@ -309,6 +351,34 @@ void STDMETHODCALLTYPE hkOM(ID3D11DeviceContext *ctx, UINT n,
             g_in_scene = (g_scene_color && ct == g_scene_color);
         } else {
             g_in_scene = false;
+        }
+    }
+
+    // ---- SPS investigation: independent double-wide scene detection ----------------
+    // Runs regardless of mode (needs no DLSS). The SPS scene target is a big RGBA16F
+    // colour + same-size depth, single slice, wider than one eye — which is exactly what
+    // the shipping matcher above rejects (it wants width == renderWidth). Setting
+    // g_sps_scene here arms the CB dump in hkVSCB for the draws of this pass.
+    if (sps_probe_on() && g_cam) {
+        g_sps_scene = false;
+        if (n > 0 && rtvs) {
+            ID3D11Texture2D *sct = tex_of_rtv(rtvs[0]);
+            ID3D11Texture2D *sdt = tex_of_dsv(dsv);
+            if (sct && sdt) {
+                D3D11_TEXTURE2D_DESC cd, dd; sct->GetDesc(&cd); sdt->GetDesc(&dd);
+                int rw = *reinterpret_cast<int *>(g_cam + 3944);
+                int rh = *reinterpret_cast<int *>(g_cam + 3948);
+                if (cd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && cd.ArraySize == 1 &&
+                    cd.Width >= 2048 && dd.Width == cd.Width && dd.Height == cd.Height) {
+                    g_sps_scene = true;
+                    if (!g_sps_scene_logged) {
+                        acre_log("  SPS: double-wide scene target %ux%u  renderWidth=%d "
+                                 "renderHeight=%d  width/rw=%.2f", cd.Width, cd.Height, rw, rh,
+                                 rw > 0 ? (float)cd.Width / rw : 0.f);
+                        g_sps_scene_logged = true;
+                    }
+                }
+            }
         }
     }
 
@@ -340,22 +410,23 @@ void STDMETHODCALLTYPE hkOM(ID3D11DeviceContext *ctx, UINT n,
 
     if (n > 0 || dsv) {
         Sig s = {};
-        if (n > 0 && rtvs) describe_rtv(rtvs[0], s.rw, s.rh, s.rf);
-        describe_dsv(dsv, s.dw, s.dh, s.df);
+        if (n > 0 && rtvs) describe_rtv(rtvs[0], s.rw, s.rh, s.rf, &s.ra, &s.rs);
+        describe_dsv(dsv, s.dw, s.dh, s.df, &s.da, &s.ds);
         // first-frames logging so the log shows what CSP binds
         bool key = (s.rf == DXGI_FORMAT_R16G16B16A16_FLOAT && s.dw >= 512 &&
                     s.rw == s.dw && s.rh == s.dh);
         if (key && g_pereye_logged < 12) {
             InterlockedIncrement(&g_pereye_logged);
-            acre_log("  OM* seq=%ld PER-EYE %ux%u color=%p depth=%p",
-                     seq, s.rw, s.rh,
+            acre_log("  OM* seq=%ld PER-EYE %ux%u arr=%u smp=%u color=%p depth=%p",
+                     seq, s.rw, s.rh, s.ra, s.rs,
                      n > 0 ? res_of_rtv(rtvs[0]) : nullptr, res_of_dsv(dsv));
         } else if (s.rw == 2560 && g_pereye_logged < 12) {
             acre_log("  OM* seq=%ld  [mirror 2560x1440 — frame landmark]", seq);
         } else if (g_logged < 20 && (s.rw >= 512 || s.dw >= 512) && !seen(s)) {
             InterlockedIncrement(&g_logged);
-            acre_log("  OM: color=%ux%u %s | depth=%ux%u %s",
-                     s.rw, s.rh, fmtname(s.rf), s.dw, s.dh, fmtname(s.df));
+            acre_log("  OM: color=%ux%u %s arr=%u smp=%u | depth=%ux%u %s arr=%u smp=%u",
+                     s.rw, s.rh, fmtname(s.rf), s.ra, s.rs,
+                     s.dw, s.dh, fmtname(s.df), s.da, s.ds);
         }
     }
     g_orig_om(ctx, n, rtvs, dsv);
@@ -377,6 +448,11 @@ ID3D11ComputeShader *g_jitter_cs = nullptr;  // adds jitter to live CB contents 
 ID3D11Buffer *g_transform_ptr = nullptr;     // the exact CSP CB to substitute this scene
 int  g_transform_slot = -1;                  // VS slot of the transform CB (found once)
 bool g_transform_found = false;
+// CSP's actual scene near/far, read from the transform CB ([52]/[53]) when it's found.
+// The SPS reprojection MUST rebuild the per-eye projection with THESE (the values the depth
+// was rendered with) — they vary by config (0.05/15000 or 0.1/20000 seen), and a mismatch
+// puts reconstructed world at the wrong distance → wrong MVs → the whole scene shakes.
+float g_cb_near = 0.0f, g_cb_far = 0.0f;
 float g_jitter_px[2] = {0, 0};               // this frame's jitter, pixels
 unsigned g_jframe = 0;
 
@@ -396,8 +472,12 @@ float halton(unsigned i, unsigned b) {
 }
 void advance_jitter() {
     g_jframe++;
-    g_jitter_px[0] = halton(g_jframe % 64 + 1, 2) - 0.5f;   // [-0.5, 0.5] px
-    g_jitter_px[1] = halton(g_jframe % 64 + 1, 3) - 0.5f;
+    // Scale amplitude (hot-reloadable). Scaling here covers BOTH the render offset (built from
+    // g_jitter_px) and the value reported to DLSS (acre_get_jitter reads g_jitter_px), so they
+    // stay consistent. Lower = smaller sub-pixel shift = less grazing-edge crawl, less AA detail.
+    float s = acre_cfg_jitter_scale();
+    g_jitter_px[0] = (halton(g_jframe % 64 + 1, 2) - 0.5f) * s;   // [-0.5, 0.5]*s px
+    g_jitter_px[1] = (halton(g_jframe % 64 + 1, 3) - 0.5f) * s;
 }
 bool is_transform_cb(const float *f) {   // projection at [16]: M[2]=(0,0,-1,-near)
     return f[24] > -0.05f && f[24] < 0.05f && f[26] < -0.9f && f[26] > -1.1f &&
@@ -469,21 +549,112 @@ void build_shadow_gpu(ID3D11DeviceContext *ctx, ID3D11Buffer *src) {
     g_shadow_valid = true;
 }
 
+// ---- SPS investigation (env ACRE_SPS_PROBE=1) ---------------------------------------
+// Under Single Pass Stereo the scene renders to one double-wide RGBA16F target; the
+// shipping per-eye matcher rejects it, so jitter/DLAA are inert. To re-establish jitter
+// we need the transform-CB layout under SPS, which now likely holds BOTH eyes' matrices.
+// This detects the double-wide scene target and dumps each distinct VS constant buffer
+// bound while it is active, so the layout can be read from acre_proxy.log. Temporary
+// diagnostic — the readback stall is fine for a non-perf run. Gated off in shipping.
+int  g_sps_probe = -1;                        // -1 unknown, 0 off, 1 on (env, read once)
+bool g_sps_scene = false;                     // double-wide scene target currently bound
+bool g_sps_scene_logged = false;
+int  g_sps_dumped = 0;
+struct SpsCbSeen { void *ptr; UINT slot; UINT size; };
+SpsCbSeen g_sps_seen[64];
+int g_sps_seen_n = 0;
+
+bool sps_probe_on() {
+    if (g_sps_probe < 0) {
+        char v[8] = {0};
+        g_sps_probe = (GetEnvironmentVariableA("ACRE_SPS_PROBE", v, sizeof(v)) && atoi(v)) ? 1 : 0;
+        if (g_sps_probe) acre_log("  SPS: probe ENABLED (ACRE_SPS_PROBE) — CB layout dump");
+    }
+    return g_sps_probe == 1;
+}
+
+// The projection block CSP uses everywhere: M[0]=(1,0,·,0) M[1]=(0,1,·,0)
+// M[2]=(0,0,-1,-near) — FOV applied outside, so [·] at row0/row1 col2 is the per-eye NDC
+// offset (0 = mono/centered). Returns the float offset where it starts, or -1.
+int sps_find_proj(const float *f, UINT nf) {
+    for (UINT o = 0; o + 15 < nf; o += 4) {          // 16-float (row) aligned
+        if (f[o+0] > 0.99f && f[o+0] < 1.01f && f[o+1] == 0.f && f[o+3] == 0.f &&
+            f[o+4] == 0.f && f[o+5] > 0.99f && f[o+5] < 1.01f && f[o+7] == 0.f &&
+            f[o+10] < -0.9f && f[o+10] > -1.1f &&                 // M[2][2] = -1
+            f[o+11] < -0.01f && f[o+11] > -0.5f)                  // M[2][3] = -near
+            return (int)o;
+    }
+    return -1;
+}
+
+void sps_dump_cb(ID3D11DeviceContext *ctx, ID3D11Buffer *b, UINT slot) {
+    if (!b || !g_om_dev || g_sps_dumped >= 48) return;
+    D3D11_BUFFER_DESC bd; b->GetDesc(&bd);
+    if (bd.ByteWidth < 64 || bd.ByteWidth > 1024) return;      // camera CBs are small
+    for (int i = 0; i < g_sps_seen_n; i++)
+        if (g_sps_seen[i].ptr == b && g_sps_seen[i].slot == slot && g_sps_seen[i].size == bd.ByteWidth)
+            return;                                            // mapped this one already
+    if (g_sps_seen_n < 64) g_sps_seen[g_sps_seen_n++] = SpsCbSeen{ b, slot, bd.ByteWidth };
+
+    D3D11_BUFFER_DESC sd = {}; sd.ByteWidth = bd.ByteWidth;
+    sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ID3D11Buffer *st = nullptr;
+    if (FAILED(g_om_dev->CreateBuffer(&sd, nullptr, &st)) || !st) return;
+    ctx->CopyResource(st, b);
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (SUCCEEDED(ctx->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
+        const float *f = static_cast<const float *>(m.pData);
+        UINT nf = bd.ByteWidth / 4;
+        int po = sps_find_proj(f, nf);                          // only log projection CBs
+        if (po >= 0) {
+            UINT lf = nf > 96 ? 96 : nf;
+            acre_log("  SPScb: slot=%u size=%u bytes  PROJECTION at float[%d]  "
+                     "eyeOffX=%.4f eyeOffY=%.4f", slot, bd.ByteWidth, po, f[po+2], f[po+6]);
+            for (UINT o = 0; o + 3 < lf; o += 4)
+                acre_log("    [%2u] % .4f % .4f % .4f % .4f", o, f[o], f[o+1], f[o+2], f[o+3]);
+            g_sps_dumped++;
+        }
+        ctx->Unmap(st, 0);
+    }
+    st->Release();
+}
+
 void STDMETHODCALLTYPE hkVSCB(ID3D11DeviceContext *ctx, UINT start, UINT num,
                               ID3D11Buffer *const *bufs) {
     g_jitter_on = acre_cfg_jitter();   // hot-reloadable
 
-    // per-eye view snapshot: first VSCB of this eye's scene pass, after viveRenderPass
-    // has written cam+2512 for this eye and before it moves on
-    if (g_in_scene && g_scene_dirty && g_cam && g_eye_counter < 2 &&
-        !g_snap_done[g_eye_counter]) {
-        memcpy(g_eye_view[g_eye_counter], reinterpret_cast<void *>(g_cam + 2512), 64);
-        g_snap_done[g_eye_counter] = true;
-        InterlockedOr(&g_eye_view_valid, 1 << g_eye_counter);
+    if (sps_probe_on() && g_sps_scene && bufs && num > 0) {
+        for (UINT i = 0; i < num; i++)
+            if (bufs[i]) sps_dump_cb(ctx, bufs[i], start + i);
     }
 
-    if (g_jitter_on && g_in_scene && g_scene_dirty && !g_shadow_valid && bufs && g_om_dev &&
-        !InterlockedCompareExchange(&g_inflight, 0, 0)) {
+    // per-eye view snapshot: first VSCB of this eye's scene pass, after viveRenderPass
+    // has written cam+2512 for this eye and before it moves on
+    if (g_in_scene && g_scene_dirty && g_cam) {
+        if (g_eye_counter < 2 && !g_snap_done[g_eye_counter]) {
+            memcpy(g_eye_view[g_eye_counter], reinterpret_cast<void *>(g_cam + 2512), 64);
+            g_snap_done[g_eye_counter] = true;
+            InterlockedOr(&g_eye_view_valid, 1 << g_eye_counter);
+        } else if (g_scene_wide && g_snap_done[0]) {
+            // SPS is a single pass with no second-eye counter, but CSP renders eye 0 first
+            // then eye 1, rewriting cam+2512 per eye. Keep the LATEST scene-bind view: by the
+            // last bind it is eye 1's render-time view — more reliable than reading cam+2512
+            // at the post-render dispatch point, where head-tracking may have moved it.
+            memcpy(g_eye_view[1], reinterpret_cast<void *>(g_cam + 2512), 64);
+            InterlockedOr(&g_eye_view_valid, 2);
+        }
+    }
+
+    // Non-SPS: build the jittered shadow ONCE per scene (per eye pass), cached until the
+    // next eye/frame. SPS: CSP renders both eyes in ONE pass, reusing the SAME transform-CB
+    // pointer but rewriting its contents (per-eye projection) between the two eye draws — so
+    // a cached shadow built from eye 0 would be substituted for eye 1 too and collapse the
+    // stereo. Rebuild the shadow from the CB's LIVE content on every bind during the scene
+    // pass, so each eye's draws get their own projection + the same sub-pixel jitter.
+    bool jbuild = g_jitter_on && g_in_scene && g_scene_dirty && bufs && g_om_dev &&
+                  !InterlockedCompareExchange(&g_inflight, 0, 0) &&
+                  (g_scene_wide || !g_shadow_valid);
+    if (jbuild) {
         InterlockedExchange(&g_inflight, 1);
         ensure_shadow_bufs(g_om_dev);
         ID3D11Buffer *tcb = nullptr;
@@ -514,14 +685,19 @@ void STDMETHODCALLTYPE hkVSCB(ID3D11DeviceContext *ctx, UINT start, UINT num,
                 ctx->Unmap(g_cb_staging, 0);
                 if (match) {
                     acre_diag_matrices(cbcopy, g_cam);
+                    // CSP CB layout: [48..51]=camPos, [52]=near, [53]=far. Capture the real
+                    // near/far so the SPS reprojection projection matches the rendered depth.
+                    if (cbcopy[52] > 0.0f && cbcopy[52] < 5.0f) g_cb_near = cbcopy[52];
+                    if (cbcopy[53] > 100.0f) g_cb_far = cbcopy[53];
                     g_transform_slot = (int)(start + i); g_transform_found = true; tcb = bufs[i];
-                    acre_log("  jitter: transform CB at VS slot %d (live-content CS add, GPU-side)",
-                             g_transform_slot);
+                    acre_log("  jitter: transform CB at VS slot %d (live-content CS add, GPU-side); "
+                             "scene near=%.4f far=%.1f", g_transform_slot, g_cb_near, g_cb_far);
                 }
             }
         }
 
         if (tcb) { g_transform_ptr = tcb; build_shadow_gpu(ctx, tcb); }
+
         InterlockedExchange(&g_inflight, 0);
     }
 
@@ -582,7 +758,38 @@ void STDMETHODCALLTYPE hkPSSRV(ID3D11DeviceContext *ctx, UINT start, UINT num,
         bool hit = false;
         for (UINT i = 0; i < num && !hit; i++)
             if (srv_resource(srvs[i]) == (ID3D11Resource *)g_scene_color) hit = true;
-        if (hit && !g_dispatched[g_expected_eye]) {
+        if (hit && g_scene_wide && !g_dispatched[0]) {
+            // ---- Single Pass Stereo: both eyes live in one double-wide target, produced
+            // in a single pass, so process them together at this one injection point. The
+            // two-pass eye-pairing landmarks (g_expected_eye / renderEye binds) don't apply.
+            g_scene_dirty = false;
+            g_dispatched[0] = g_dispatched[1] = true;
+            InterlockedExchange(&g_inflight, 1);
+            __try {
+                if (g_dlss_enabled) {
+                    // ldr=0: DLAA in place on the double-wide HDR scene.
+                    acre_diag_eye(0); acre_diag_eye(1);
+                    D3D11StateBackup bak;
+                    d3d11_backup(ctx, &bak);
+                    ctx->OMSetRenderTargets(0, nullptr, nullptr);
+                    acre_dlss_inplace_sps(g_om_dev, ctx, g_scene_color, g_scene_depth, g_cam);
+                    d3d11_restore(ctx, &bak);
+                } else if (g_upscale_mode) {
+                    // ldr=1: DLAA happens later at the submit point on each eye's LDR renderEye.
+                    // Here just extract both eyes' depth from the double-wide for that path's MVs.
+                    D3D11StateBackup bak;
+                    d3d11_backup(ctx, &bak);
+                    acre_sps_capture_depth_submit(g_om_dev, ctx, g_scene_color, g_scene_depth, g_cam);
+                    d3d11_restore(ctx, &bak);
+                }
+                // (mode=off reference capture under SPS: not wired — DLAA is the target.)
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                static long e = 0;
+                if (e++ < 3) acre_log("  sps: SEH 0x%08lx — disabled", GetExceptionCode());
+                g_dlss_enabled = false;
+            }
+            InterlockedExchange(&g_inflight, 0);
+        } else if (hit && !g_scene_wide && !g_dispatched[g_expected_eye]) {
             int eye = g_expected_eye;
             g_scene_dirty = false;
             g_dispatched[eye] = true;
@@ -627,6 +834,17 @@ void *patch_slot(void **vtable, int i, void *repl) {
 
 static uintptr_t deref(uintptr_t p, uintptr_t off) {
     uintptr_t a = p + off; return (a < 0x10000) ? 0 : *reinterpret_cast<uintptr_t *>(a);
+}
+
+// True while CSP's double-wide Single Pass Stereo scene target is the one being processed.
+// Lets shared code (dlss_pass diagnostics) skip two-pass-only checks that are meaningless
+// under SPS (both eyes share one mono view, so their "separation" is legitimately zero).
+extern "C" int acre_sps_active(void) { return g_scene_wide ? 1 : 0; }
+
+// CSP's live scene near/far (from the transform CB). Returns false until captured.
+extern "C" int acre_scene_nearfar(float *nearz, float *farz) {
+    if (g_cb_near <= 0.0f || g_cb_far <= 0.0f) return 0;
+    *nearz = g_cb_near; *farz = g_cb_far; return 1;
 }
 
 extern "C" void acre_install_om_hook(ID3D11DeviceContext *ctx) {
