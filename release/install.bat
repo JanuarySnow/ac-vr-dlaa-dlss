@@ -2,22 +2,6 @@
 setlocal enabledelayedexpansion
 title AC DLSS/DLAA installer
 
-rem --- 0. self-elevate: Steam's default install lives under Program Files (x86),
-rem which needs admin to write. Without this the copies below fail with
-rem "Access is denied" and (previously, silently) nothing got installed. ---
-net session >nul 2>&1
-if errorlevel 1 (
-    echo Requesting administrator rights ^(needed to write into the AC folder^)...
-    powershell -NoProfile -Command "Start-Process -Verb RunAs -FilePath '%~f0' -ArgumentList @('%~1')" 2>nul
-    if errorlevel 1 (
-        echo.
-        echo Could not elevate automatically. Right-click install.bat and pick
-        echo "Run as administrator", then try again.
-        pause
-    )
-    exit /b
-)
-
 set "HERE=%~dp0"
 set "AC_DIR="
 
@@ -49,8 +33,9 @@ if not defined AC_DIR (
     )
 )
 
-rem --- 4. confirm an auto-detected path, or fall through to manual entry ---
-if defined AC_DIR (
+rem --- 4. confirm an auto-detected path, or fall through to manual entry.
+rem (skip the prompt on an elevated relaunch - the user already confirmed) ---
+if defined AC_DIR if /i not "%~2"=="__elevated__" (
     echo Found Assetto Corsa at:
     echo   !AC_DIR!
     set /p "CONFIRM=Install here? [Y/n] "
@@ -84,7 +69,34 @@ if not errorlevel 1 (
     exit /b 1
 )
 
-rem --- 6. install (every copy is checked; a failure aborts loudly instead of
+rem --- 6. elevate ONLY if the AC folder isn't writable (Steam's default under
+rem Program Files needs admin; a library folder on another drive usually doesn't).
+rem Probe with a throwaway file so we don't pop a UAC prompt when it's unnecessary. ---
+set "WTEST=!AC_DIR!__acre_write_test.tmp"
+( echo test ) > "!WTEST!" 2>nul
+if exist "!WTEST!" (
+    del "!WTEST!" >nul 2>&1
+) else (
+    net session >nul 2>&1
+    if errorlevel 1 (
+        echo.
+        echo "!AC_DIR!" needs administrator rights to write into - requesting...
+        rem Re-launch elevated, handing the resolved acs.exe path back as arg 1 so
+        rem the elevated run skips straight to the install with no re-prompting.
+        powershell -NoProfile -Command "Start-Process -Verb RunAs -FilePath '%~f0' -ArgumentList @('!AC_DIR!acs.exe','__elevated__')" 2>nul
+        if errorlevel 1 (
+            echo.
+            echo Could not elevate automatically. Right-click install.bat and pick
+            echo "Run as administrator", then try again.
+            pause
+        )
+        exit /b
+    )
+    rem Already elevated but still can't write - a real permissions/AV problem.
+    goto copy_fail
+)
+
+rem --- 7. install (every copy is checked; a failure aborts loudly instead of
 rem     pretending to succeed) ---
 copy /y "%HERE%dxgi.dll" "!AC_DIR!dxgi.dll" >nul
 if errorlevel 1 goto copy_fail
