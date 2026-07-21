@@ -16,7 +16,9 @@ in Content Manager:
 
 - Disable Post-process antialiasing in settings->custom shaders patch->graphics adjustments
 
-- Disable Single Pass Stereo in settings->custom shaders patch->VR
+- Disable Single Pass Stereo in settings->custom shaders patch->VR 
+as of version 0.40 I got it to work with Single Pass Stereo, but it looks worse, and dosnt gain much fps, as SPS is mostly a cpu optimization and these cases arent often cpu limited
+I cant work out how to improve it further with SPS
 
 - Probably disable VRS too in that same section, might not play well
 
@@ -29,6 +31,11 @@ DLAA is nice though, very similar results to MSAA 8x but at a much lower perform
 In DLAA mode you can also raise `render_scale` in acre.ini for supersampling above native res, for even cleaner edges at a (quadratic) performance cost. Needs a session restart to take effect.
 
 acre_proxy.log now runs a preflight check on startup and logs clearly if any of the settings above (SPS, MSAA, post-process AA, post-processing) are wrong, plus whether DLAA is actually active on both eyes — check it there first if something looks off.
+
+Performance - DLAA gains around 10 fps over MSAA8x, and looks a bit worse, but mostly on par with MSAA
+DLSS dosnt gain much, maybe 15 fps compared to native and can have the usual DLSS artifacts.
+
+These arent huge wins, as AC dosnt have motion vectors, its never gonna as good as it could be, but its a fun exercise to play around with.
 
 I will not paywall this on Patreon, this is GPL licensed, its free, use it. have it, fork it, improve it. 
 But please do buy me a coffee if you want to :
