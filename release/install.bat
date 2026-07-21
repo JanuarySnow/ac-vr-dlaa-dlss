@@ -2,6 +2,22 @@
 setlocal enabledelayedexpansion
 title AC DLSS/DLAA installer
 
+rem --- 0. self-elevate: Steam's default install lives under Program Files (x86),
+rem which needs admin to write. Without this the copies below fail with
+rem "Access is denied" and (previously, silently) nothing got installed. ---
+net session >nul 2>&1
+if errorlevel 1 (
+    echo Requesting administrator rights ^(needed to write into the AC folder^)...
+    powershell -NoProfile -Command "Start-Process -Verb RunAs -FilePath '%~f0' -ArgumentList @('%~1')" 2>nul
+    if errorlevel 1 (
+        echo.
+        echo Could not elevate automatically. Right-click install.bat and pick
+        echo "Run as administrator", then try again.
+        pause
+    )
+    exit /b
+)
+
 set "HERE=%~dp0"
 set "AC_DIR="
 
@@ -68,10 +84,13 @@ if not errorlevel 1 (
     exit /b 1
 )
 
-rem --- 6. install ---
+rem --- 6. install (every copy is checked; a failure aborts loudly instead of
+rem     pretending to succeed) ---
 copy /y "%HERE%dxgi.dll" "!AC_DIR!dxgi.dll" >nul
+if errorlevel 1 goto copy_fail
 if not exist "!AC_DIR!acre.ini" (
     copy /y "%HERE%acre.ini" "!AC_DIR!acre.ini" >nul
+    if errorlevel 1 goto copy_fail
     echo installed acre.ini ^(default: mode=dlaa^)
 ) else (
     echo acre.ini already present - left as-is
@@ -81,15 +100,19 @@ rem working copy that's already there.
 if exist "%HERE%nvngx_dlss.dll" (
     if not exist "!AC_DIR!nvngx_dlss.dll" (
         copy /y "%HERE%nvngx_dlss.dll" "!AC_DIR!nvngx_dlss.dll" >nul
+        if errorlevel 1 goto copy_fail
         echo installed nvngx_dlss.dll ^(NVIDIA DLSS runtime^)
     ) else (
         echo nvngx_dlss.dll already present - left as-is
     )
 )
-rem dxgi_real.dll lets the proxy forward to the real DXGI - generated from THIS
-rem machine's own System32 copy, never shipped in the release.
-copy /y "%WINDIR%\System32\dxgi.dll" "!AC_DIR!dxgi_real.dll" >nul
+rem The proxy loads the real DXGI itself from System32 at launch, so there is no
+rem dxgi_real.dll to generate here anymore - dxgi.dll is fully self-contained.
 if exist "!AC_DIR!acre_proxy.log" del "!AC_DIR!acre_proxy.log"
+
+rem Clean up dxgi_real.dll left behind by older installers - it's now unused and
+rem an out-of-date copy could only cause confusion.
+if exist "!AC_DIR!dxgi_real.dll" del "!AC_DIR!dxgi_real.dll"
 
 echo.
 echo Installed to !AC_DIR!
@@ -98,3 +121,16 @@ echo edit and save it while the game is running to apply changes live.
 echo.
 pause
 exit /b 0
+
+:copy_fail
+echo.
+echo *** INSTALL FAILED: a file could not be copied into
+echo     "!AC_DIR!"
+echo.
+echo Most likely the folder is write-protected. Make sure Assetto Corsa is
+echo fully closed, then run this installer again ^(it should have already asked
+echo for administrator rights^). If it still fails, your antivirus may be
+echo blocking the copy.
+echo.
+pause
+exit /b 1

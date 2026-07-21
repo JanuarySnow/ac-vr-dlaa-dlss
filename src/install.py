@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Install / uninstall the DXGI proxy into the Assetto Corsa folder.
 
-Copies build\\dxgi.dll and build\\dxgi_real.dll next to acs.exe. Uninstall removes
-exactly those two files and nothing else.
+Copies build\\dxgi.dll next to acs.exe (self-contained; it loads the real DXGI from
+System32 at runtime). Uninstall removes it, plus any stale dxgi_real.dll from older
+versions, and nothing else.
 
   python install.py --status
   python install.py --install
@@ -20,7 +21,10 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.path.join(HERE, "build")
-FILES = ("dxgi.dll", "dxgi_real.dll")
+FILES = ("dxgi.dll",)
+# dxgi_real.dll was generated next to acs.exe by older versions; the proxy now
+# loads the real DXGI from System32 itself. Remove any stale copy on install/uninstall.
+LEGACY = ("dxgi_real.dll",)
 
 def find_ac_dir():
     """Find the AC install: Steam registry + library folders, then common paths."""
@@ -90,6 +94,11 @@ def install():
     for f in FILES:
         shutil.copy2(os.path.join(BUILD, f), os.path.join(AC_DIR, f))
         print(f"installed {f}")
+    for f in LEGACY:
+        p = os.path.join(AC_DIR, f)
+        if os.path.isfile(p):
+            os.remove(p)
+            print(f"removed stale {f}")
     # acre.ini: only place the default if the user doesn't already have one
     ini_dst = os.path.join(AC_DIR, "acre.ini")
     if not os.path.isfile(ini_dst):
@@ -106,7 +115,7 @@ def uninstall():
     if _ac_running():
         print("acs.exe is running — close it first")
         return 1
-    for f in FILES:
+    for f in FILES + LEGACY:
         p = os.path.join(AC_DIR, f)
         if os.path.isfile(p):
             os.remove(p)

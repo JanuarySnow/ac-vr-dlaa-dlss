@@ -4,6 +4,7 @@ src/build/
 # generated at build time by gen_def.py
 src/thunks.asm
 src/exports.def
+src/real_ptrs.c
 src/dxgi_names.h
 
 # vendor/DLSS and vendor/minhook are git submodules (see .gitmodules), not ignored
