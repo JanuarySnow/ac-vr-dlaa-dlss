@@ -17,6 +17,7 @@ in Content Manager:
 - Disable Post-process antialiasing in settings->custom shaders patch->graphics adjustments
 
 - Disable Single Pass Stereo in settings->custom shaders patch->VR 
+
 as of version 0.40 I got it to work with Single Pass Stereo, but it looks worse, and dosnt gain much fps, as SPS is mostly a cpu optimization and these cases arent often cpu limited
 I cant work out how to improve it further with SPS
 
