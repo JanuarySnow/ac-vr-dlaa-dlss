@@ -118,13 +118,15 @@ if exist "%HERE%nvngx_dlss.dll" (
         echo nvngx_dlss.dll already present - left as-is
     )
 )
-rem The proxy loads the real DXGI itself from System32 at launch, so there is no
-rem dxgi_real.dll to generate here anymore - dxgi.dll is fully self-contained.
+rem dxgi_real.dll lets the proxy forward to the real DXGI - generated from THIS
+rem machine's own System32 copy, never shipped in the release. Without it AC
+rem fails at launch, so verify it landed. (The proxy imports this by name, so the
+rem loader fills the forward table before any of our code runs - which is exactly
+rem why forwarding must go through a renamed file, not a runtime LoadLibrary.)
+copy /y "%WINDIR%\System32\dxgi.dll" "!AC_DIR!dxgi_real.dll" >nul
+if errorlevel 1 goto copy_fail
+if not exist "!AC_DIR!dxgi_real.dll" goto copy_fail
 if exist "!AC_DIR!acre_proxy.log" del "!AC_DIR!acre_proxy.log"
-
-rem Clean up dxgi_real.dll left behind by older installers - it's now unused and
-rem an out-of-date copy could only cause confusion.
-if exist "!AC_DIR!dxgi_real.dll" del "!AC_DIR!dxgi_real.dll"
 
 echo.
 echo Installed to !AC_DIR!
