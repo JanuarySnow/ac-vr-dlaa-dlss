@@ -8,6 +8,8 @@ Early build, testing may show issues, but seems ok so far, though because CSP ha
 
 ### To make it work:
 
+YOU NEED TO BE ON WINDOWS 11 for this to work, ill see if I can make it work for win10...
+
 in Content Manager:
 
 - Enable post-processing in settings->assetto corsa->video
